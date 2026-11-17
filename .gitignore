@@ -1,0 +1,18 @@
+# Sensitive local user data & logs (NEVER commit)
+data/
+logs/
+*.jsonl
+
+# Build artifacts & compiled binaries (use GitHub Releases for .exe)
+build/
+dist/
+*.exe
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+.env
