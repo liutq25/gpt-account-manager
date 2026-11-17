@@ -55,6 +55,7 @@ class AccountFormResult:
     apply_weekly_timer: bool
     weekly_reset_seconds: int
     clear_weekly_timer: bool
+    clear_five_hour_timer: bool = False
 
 
 @dataclass
@@ -64,6 +65,7 @@ class QuickQuotaResult:
     apply_weekly_timer: bool
     weekly_reset_seconds: int
     clear_weekly_timer: bool
+    clear_five_hour_timer: bool = False
 
 
 @dataclass
@@ -238,6 +240,10 @@ class AccountDialog(QDialog):
         five_hint.setStyleSheet(f"color: {p.text_muted}; font-size: 11px;")
         five_hint.setWordWrap(True)
 
+        self.five_status_label = QLabel("")
+        self.five_status_label.setStyleSheet(f"color: {p.warn_text}; font-size: 12px; font-weight: 600;")
+        self.clear_five_chk = QCheckBox("取消当前 5h 重置倒计时")
+
         self.weekly_spin = QSpinBox()
         self.weekly_spin.setRange(0, MAX_QUOTA)
         self.weekly_spin.setValue(MAX_QUOTA)
@@ -261,6 +267,10 @@ class AccountDialog(QDialog):
 
         quota_form.addRow("5h 剩余额度:", self.five_spin)
         quota_form.addRow("", five_hint)
+        if self._is_edit:
+            quota_form.addRow("当前 5h 倒计时:", self.five_status_label)
+            quota_form.addRow("", self.clear_five_chk)
+
         quota_form.addRow("周剩余额度:", self.weekly_spin)
 
         if self._is_edit:
@@ -268,6 +278,7 @@ class AccountDialog(QDialog):
             quota_form.addRow("", self.reset_weekly_chk)
             quota_form.addRow("", self.clear_weekly_chk)
         else:
+            self.clear_five_chk.setVisible(False)
             self.reset_weekly_chk.setChecked(True)
             self.reset_weekly_chk.setVisible(False)
             self.clear_weekly_chk.setVisible(False)
@@ -323,6 +334,15 @@ class AccountDialog(QDialog):
         self.two_fa_edit.setText(account.two_fa)
         self.five_spin.setValue(account.five_hour_quota)
         self.weekly_spin.setValue(account.weekly_quota)
+
+        five_rem = account.five_hour_remaining_seconds(time.time())
+        if five_rem is not None and five_rem > 0:
+            self.five_status_label.setText(f"倒计时运行中（剩余 {format_duration(five_rem)}）")
+            self.clear_five_chk.setVisible(True)
+            self.clear_five_chk.setChecked(False)
+        else:
+            self.five_status_label.setText("未启动 5h 倒计时")
+            self.clear_five_chk.setVisible(False)
 
         rem = account.weekly_remaining_seconds(time.time())
         if rem is not None and rem > 0:
@@ -395,6 +415,7 @@ class AccountDialog(QDialog):
             apply_weekly_timer=self.reset_weekly_chk.isChecked(),
             weekly_reset_seconds=duration_sec,
             clear_weekly_timer=self.clear_weekly_chk.isChecked(),
+            clear_five_hour_timer=self.clear_five_chk.isChecked() if self._is_edit else False,
         )
         self.accept()
 
@@ -584,6 +605,18 @@ class QuickQuotaDialog(QDialog):
         five_note = QLabel("设为 0 后自动开始 5h 倒计时，5h 后自动恢复为 100。")
         five_note.setStyleSheet(f"color: {p.text_muted}; font-size: 11px;")
 
+        five_rem = self._account.five_hour_remaining_seconds(time.time())
+        self.five_status_label = QLabel()
+        self.clear_5h_chk = QCheckBox("取消当前 5h 重置倒计时")
+        if five_rem is not None and five_rem > 0:
+            self.five_status_label.setText(f"倒计时运行中（剩余 {format_duration(five_rem)}）")
+            self.five_status_label.setStyleSheet(f"color: {p.warn_text}; font-size: 12px; font-weight: 600;")
+            self.clear_5h_chk.setVisible(True)
+        else:
+            self.five_status_label.setText("未启动 5h 倒计时")
+            self.five_status_label.setStyleSheet(f"color: {p.text_muted}; font-size: 12px;")
+            self.clear_5h_chk.setVisible(False)
+
         self.weekly_spin = QSpinBox()
         self.weekly_spin.setRange(0, MAX_QUOTA)
         self.weekly_spin.setValue(self._account.weekly_quota)
@@ -615,6 +648,9 @@ class QuickQuotaDialog(QDialog):
 
         form.addRow("5h 剩余额度:", self.five_spin)
         form.addRow("", five_note)
+        form.addRow("5h 倒计时状态:", self.five_status_label)
+        if self.clear_5h_chk.isVisible():
+            form.addRow("", self.clear_5h_chk)
         form.addRow("周剩余额度:", self.weekly_spin)
         form.addRow("周倒计时状态:", self.weekly_status_label)
         if self.reset_weekly_chk.isVisible():
@@ -662,6 +698,7 @@ class QuickQuotaDialog(QDialog):
             apply_weekly_timer=self.reset_weekly_chk.isChecked(),
             weekly_reset_seconds=duration_sec,
             clear_weekly_timer=self.clear_weekly_chk.isChecked(),
+            clear_five_hour_timer=self.clear_5h_chk.isChecked(),
         )
         self.accept()
 

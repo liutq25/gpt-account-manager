@@ -8,6 +8,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from types import SimpleNamespace
 from unittest import mock
 
 from PyQt5.QtWidgets import QApplication
@@ -68,7 +69,13 @@ class TestQuotaLogic(unittest.TestCase):
             now_ts=t0,
         )
         self.assertIsNotNone(acc.five_hour_reset_at)
-        events = acc.update_five_hour_quota(50, now_ts=t0 + 60)
+        # 默认不破坏现有倒计时
+        events_keep = acc.update_five_hour_quota(50, now_ts=t0 + 30)
+        self.assertEqual(events_keep, [])
+        self.assertIsNotNone(acc.five_hour_reset_at)
+
+        # 显式勾选 clear_timer 时清除
+        events = acc.update_five_hour_quota(50, clear_timer=True, now_ts=t0 + 60)
         self.assertEqual(events, ["CLEAR_5H_COUNTDOWN"])
         self.assertIsNone(acc.five_hour_reset_at)
 
@@ -271,8 +278,9 @@ class TestPersistenceThemeAndUI(unittest.TestCase):
         events = acc_ready.start_five_hour_usage(now_ts=t0 + 5)
         self.assertEqual(events, ["START_5H_COUNTDOWN"])
         self.assertEqual(acc_ready.five_hour_reset_at, t0 + 5 + FIVE_HOURS_SECONDS)
-        # Calling again preserves existing timer
-        self.assertEqual(acc_ready.start_five_hour_usage(now_ts=t0 + 50), [])
+        # Calling again when counting down raises ValueError (strict fail-fast)
+        with self.assertRaises(ValueError):
+            acc_ready.start_five_hour_usage(now_ts=t0 + 50)
         self.assertEqual(acc_ready.five_hour_reset_at, t0 + 5 + FIVE_HOURS_SECONDS)
         # Expiry restores 100
         self.assertEqual(acc_ready.tick(t0 + 5 + FIVE_HOURS_SECONDS), ["AUTO_RESET_5H"])
@@ -359,6 +367,209 @@ class TestPersistenceThemeAndUI(unittest.TestCase):
             win._on_tick()
             self.assertEqual(mock_toast.call_count, 1)
             win.close()
+
+
+class TestEdgeCasesAndWeirdUserBehavior(unittest.TestCase):
+    """专门针对奇葩用户操作、边界异常输入、状态机矛盾转移与极值进行的回归测试。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication(sys.argv)
+
+    def test_weekly_zero_prohibits_start_five_hour_usage(self) -> None:
+        t0 = 1_700_000_000.0
+        acc = Account.create(
+            name="周额度已空",
+            email="weekly_zero@example.com",
+            password="pw",
+            two_fa="123456",
+            five_hour_quota=100,
+            weekly_quota=0,
+            now_ts=t0,
+        )
+        can_start, reason = acc.can_start_five_hour_usage
+        self.assertFalse(can_start)
+        self.assertIn("周额度已耗尽", reason)
+
+        with self.assertRaises(ValueError) as ctx:
+            acc.start_five_hour_usage(now_ts=t0)
+        self.assertIn("周额度已耗尽", str(ctx.exception))
+
+    def test_five_hour_zero_prohibits_start_five_hour_usage(self) -> None:
+        t0 = 1_700_000_000.0
+        acc = Account.create(
+            name="短期额度已空",
+            email="five_zero@example.com",
+            password="pw",
+            two_fa="123456",
+            five_hour_quota=0,
+            weekly_quota=100,
+            now_ts=t0,
+        )
+        can_start, reason = acc.can_start_five_hour_usage
+        self.assertFalse(can_start)
+        # 已经在倒计时中，调用必抛出 ValueError
+        with self.assertRaises(ValueError):
+            acc.start_five_hour_usage(now_ts=t0)
+
+        # 清除倒计时后但额度依然为 0，调用仍必抛出 ValueError
+        acc.update_five_hour_quota(0, clear_timer=True, now_ts=t0)
+        self.assertIsNone(acc.five_hour_reset_at)
+        can_start2, reason2 = acc.can_start_five_hour_usage
+        self.assertFalse(can_start2)
+        self.assertIn("额度已为 0", reason2)
+        with self.assertRaises(ValueError):
+            acc.start_five_hour_usage(now_ts=t0)
+
+    def test_countdown_persists_across_quota_edits_unless_explicitly_cleared(self) -> None:
+        t0 = 1_700_000_000.0
+        acc = Account.create(
+            name="中途改额度",
+            email="edit_quota@example.com",
+            password="pw",
+            two_fa="123456",
+            five_hour_quota=100,
+            weekly_quota=80,
+            now_ts=t0,
+        )
+        acc.start_five_hour_usage(now_ts=t0)
+        expected_reset = t0 + FIVE_HOURS_SECONDS
+        self.assertEqual(acc.five_hour_reset_at, expected_reset)
+
+        # 奇葩用户中途将额度从 100 改为 50，倒计时时间戳不得被清空或重置
+        events = acc.update_five_hour_quota(50, now_ts=t0 + 600)
+        self.assertEqual(events, [])
+        self.assertEqual(acc.five_hour_quota, 50)
+        self.assertEqual(acc.five_hour_reset_at, expected_reset)
+
+        # 奇葩用户再改为 0，倒计时依旧保留原始截止时间
+        events_zero = acc.update_five_hour_quota(0, now_ts=t0 + 1200)
+        self.assertEqual(events_zero, [])
+        self.assertEqual(acc.five_hour_reset_at, expected_reset)
+
+        # 奇葩用户勾选“清除倒计时”
+        events_clear = acc.update_five_hour_quota(80, clear_timer=True, now_ts=t0 + 1500)
+        self.assertIn("CLEAR_5H_COUNTDOWN", events_clear)
+        self.assertIsNone(acc.five_hour_reset_at)
+        self.assertEqual(acc.five_hour_quota, 80)
+
+    def test_weird_text_parsing_delimiters_and_dirt(self) -> None:
+        # 中文破折号、冒号、空行、脏乱注释
+        messy_input = (
+            "   \n"
+            "user1@test.com——Password!123——JBSWY3DPEHPK3PXP\n"
+            "一些无用的废话客服提示\n"
+            "user2@test.com:SecretPwd999:OR4XAZLSEBXXG2LM\n"
+            "user3@test.com----Pass3----123456\n"
+        )
+        parsed = parse_accounts_from_text(messy_input)
+        self.assertEqual(len(parsed), 3)
+        self.assertEqual(parsed[0].email, "user1@test.com")
+        self.assertEqual(parsed[0].password, "Password!123")
+        self.assertEqual(parsed[0].two_fa, "JBSWY3DPEHPK3PXP")
+        self.assertEqual(parsed[1].email, "user2@test.com")
+        self.assertEqual(parsed[1].password, "SecretPwd999")
+        self.assertEqual(parsed[2].email, "user3@test.com")
+
+    def test_batch_import_deduplicates_by_email_and_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = AccountStorage(Path(tmp))
+            existing_acc = Account.create(
+                name="老账号",
+                email="repeat@example.com",
+                password="old_password",
+                two_fa="OLD_2FA",
+                five_hour_quota=40,
+                weekly_quota=60,
+            )
+            storage.save_accounts([existing_acc])
+
+            win = MainWindow(storage)
+            self.assertEqual(len(win.accounts), 1)
+
+            # 模拟批导同一个邮箱的新密码
+            with mock.patch("src.main_window.BatchImportDialog") as MockDlg:
+                MockDlg.Accepted = 1
+                mock_inst = MockDlg.return_value
+                mock_inst.exec_.return_value = 1  # Accepted
+                mock_inst.imported_items = [
+                    SimpleNamespace(
+                        name="更新后的号",
+                        email="repeat@example.com",
+                        password="new_password_888",
+                        two_fa="NEW_2FA_CODE",
+                        five_hour_quota=100,
+                        weekly_quota=100,
+                    )
+                ]
+                with mock.patch("src.main_window.QMessageBox.information"):
+                    win._on_batch_import()
+
+            self.assertEqual(len(win.accounts), 1)
+            updated = win.accounts[0]
+            self.assertEqual(updated.password, "new_password_888")
+            self.assertEqual(updated.two_fa, "NEW_2FA_CODE")
+            # 额度与状态维持已有数据
+            self.assertEqual(updated.five_hour_quota, 40)
+            self.assertEqual(updated.weekly_quota, 60)
+            win.close()
+
+    def test_gui_button_state_reflects_weekly_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = AccountStorage(Path(tmp))
+            acc = Account.create(
+                name="周额为0的号",
+                email="w0@test.com",
+                password="pw",
+                two_fa="123456",
+                five_hour_quota=100,
+                weekly_quota=0,
+            )
+            storage.save_accounts([acc])
+            win = MainWindow(storage)
+            rw = win._row_widgets[acc.id]
+            self.assertFalse(rw.start_5h_btn.isEnabled())
+            self.assertEqual(rw.start_5h_btn.text(), "无周额度")
+
+            # 若用户强行调用 slot，弹出警告
+            with mock.patch("src.main_window.QMessageBox.warning") as mock_warn:
+                win._on_start_5h_usage(acc.id)
+                self.assertTrue(mock_warn.called)
+
+            win.close()
+
+    def test_cli_check_notify_mode(self) -> None:
+        """测试计划任务后台静默触发的 --check-notify 模式。"""
+        import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_data_dir = Path(tmp)
+            storage = AccountStorage(tmp_data_dir)
+            t0 = 1_700_000_000.0
+            acc = Account.create(
+                name="后台提醒号",
+                email="cli_test@example.com",
+                password="pw",
+                two_fa="123456",
+                five_hour_quota=100,
+                weekly_quota=50,
+                weekly_reset_duration_seconds=12 * 3600,
+                now_ts=t0,
+            )
+            storage.save_accounts([acc])
+
+            with mock.patch("src.storage.resolve_app_dir", return_value=tmp_data_dir), \
+                 mock.patch("src.notifier.send_windows_toast") as mock_toast, \
+                 mock.patch("sys.argv", ["main.py", "--check-notify"]):
+                # 模拟当前时间
+                with mock.patch("time.time", return_value=t0 + 100):
+                    exit_code = main.main()
+                    self.assertEqual(exit_code, 0)
+                    self.assertTrue(mock_toast.called)
+
+            # 重新加载确认已记录通知时间戳，避免重复轰炸
+            loaded = storage.load_accounts()
+            self.assertIsNotNone(loaded[0].weekly_notified_reset_at)
 
 
 if __name__ == "__main__":

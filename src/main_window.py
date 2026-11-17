@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (
     QAction,
     QApplication,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -648,6 +649,7 @@ class MainWindow(QMainWindow):
         if five_rem is not None:
             rw.start_5h_btn.setText("计时中")
             rw.start_5h_btn.setEnabled(False)
+            rw.start_5h_btn.setToolTip("5h 重置倒计时运行中")
             rw.start_5h_btn.setStyleSheet(
                 f"padding: 2px 6px; font-size: 11px; background-color: {p.input_disabled_bg}; "
                 f"color: {p.text_muted}; border: 1px solid {p.border}; border-radius: 4px;"
@@ -658,12 +660,29 @@ class MainWindow(QMainWindow):
                 f"color: {p.warn_text}; background-color: {p.warn_bg}; border-radius: 4px; padding: 3px 6px;"
             )
         else:
-            rw.start_5h_btn.setText("开始使用")
-            rw.start_5h_btn.setEnabled(True)
-            rw.start_5h_btn.setStyleSheet(
-                f"padding: 2px 6px; font-size: 11px; background-color: {p.primary_bg}; "
-                f"color: #FFFFFF; border: none; border-radius: 4px; font-weight: 600;"
-            )
+            can_start, reason = acc.can_start_five_hour_usage
+            if not can_start:
+                if acc.weekly_quota <= 0:
+                    btn_text = "无周额度"
+                elif acc.five_hour_quota <= 0:
+                    btn_text = "额度为0"
+                else:
+                    btn_text = "不可用"
+                rw.start_5h_btn.setText(btn_text)
+                rw.start_5h_btn.setEnabled(False)
+                rw.start_5h_btn.setToolTip(reason)
+                rw.start_5h_btn.setStyleSheet(
+                    f"padding: 2px 6px; font-size: 11px; background-color: {p.input_disabled_bg}; "
+                    f"color: {p.text_muted}; border: 1px solid {p.border}; border-radius: 4px;"
+                )
+            else:
+                rw.start_5h_btn.setText("开始使用")
+                rw.start_5h_btn.setEnabled(True)
+                rw.start_5h_btn.setToolTip("开始使用并立即启动 5 小时倒计时（5 小时后自动恢复为 100 额度）")
+                rw.start_5h_btn.setStyleSheet(
+                    f"padding: 2px 6px; font-size: 11px; background-color: {p.primary_bg}; "
+                    f"color: #FFFFFF; border: none; border-radius: 4px; font-weight: 600;"
+                )
             rw.five_timer_label.setText("未触发")
             rw.five_timer_label.setStyleSheet(f"color: {p.text_muted}; font-size: 12px;")
 
@@ -711,19 +730,26 @@ class MainWindow(QMainWindow):
         acc = self._find_account(account_id)
         if acc is None:
             return
+        can_start, reason = acc.can_start_five_hour_usage
+        if not can_start:
+            QMessageBox.warning(self, "无法开始使用", f"账号「{acc.name}」暂无法开始使用：\n{reason}")
+            return
         now = time.time()
-        events = acc.start_five_hour_usage(now)
-        if events:
-            self._save_accounts_safe()
-            acc_ref = f"{acc.name} ({acc.email})"
-            self._record_log(
-                "INFO",
-                "USAGE_5H_STARTED",
-                "点击「开始使用」，已启动 5 小时重置倒计时（5 小时后自动恢复为 100 额度）。",
-                acc_ref,
-            )
-            self._rebuild_account_table()
-            self._refresh_kpis(now)
+        try:
+            events = acc.start_five_hour_usage(now)
+            if events:
+                self._save_accounts_safe()
+                acc_ref = f"{acc.name} ({acc.email})"
+                self._record_log(
+                    "INFO",
+                    "USAGE_5H_STARTED",
+                    "点击「开始使用」，已启动 5 小时重置倒计时（5 小时后自动恢复为 100 额度）。",
+                    acc_ref,
+                )
+                self._rebuild_account_table()
+                self._refresh_kpis(now)
+        except ValueError as err:
+            QMessageBox.warning(self, "无法开始使用", str(err))
 
     def _on_tick(self) -> None:
         now = time.time()
@@ -839,34 +865,55 @@ class MainWindow(QMainWindow):
 
     def _on_batch_import(self) -> None:
         dlg = BatchImportDialog(self, palette=self._palette)
-        if dlg.exec_() != BatchImportDialog.Accepted or not dlg.imported_items:
+        if dlg.exec_() != QDialog.Accepted or not dlg.imported_items:
             return
         now = time.time()
         added_count = 0
+        updated_count = 0
         for item in dlg.imported_items:
-            acc = Account.create(
-                name=item.name,
-                email=item.email,
-                password=item.password,
-                two_fa=item.two_fa,
-                five_hour_quota=item.five_hour_quota,
-                weekly_quota=item.weekly_quota,
-                weekly_reset_duration_seconds=0,
-                now_ts=now,
-            )
-            self.accounts.append(acc)
-            added_count += 1
-            self._record_log(
-                "INFO",
-                "ACCOUNT_BATCH_IMPORTED",
-                f"智能文本导入账号：5h={acc.five_hour_quota}，周={acc.weekly_quota}。",
-                f"{acc.name} ({acc.email})",
-            )
+            # 奇葩用户防御：若列表中已存在相同邮箱的账号，更新凭据而非盲目追加重复项
+            existing = next((a for a in self.accounts if a.email.strip().lower() == item.email.strip().lower()), None)
+            if existing is not None:
+                existing.name = item.name
+                existing.password = item.password
+                existing.two_fa = item.two_fa
+                updated_count += 1
+                self._record_log(
+                    "INFO",
+                    "ACCOUNT_BATCH_UPDATED",
+                    f"智能文本批量更新已有账号凭据：5h={existing.five_hour_quota}，周={existing.weekly_quota}。",
+                    f"{existing.name} ({existing.email})",
+                )
+            else:
+                acc = Account.create(
+                    name=item.name,
+                    email=item.email,
+                    password=item.password,
+                    two_fa=item.two_fa,
+                    five_hour_quota=item.five_hour_quota,
+                    weekly_quota=item.weekly_quota,
+                    weekly_reset_duration_seconds=0,
+                    now_ts=now,
+                )
+                self.accounts.append(acc)
+                added_count += 1
+                self._record_log(
+                    "INFO",
+                    "ACCOUNT_BATCH_IMPORTED",
+                    f"智能文本导入新账号：5h={acc.five_hour_quota}，周={acc.weekly_quota}。",
+                    f"{acc.name} ({acc.email})",
+                )
 
         self._save_accounts_safe()
         self._rebuild_account_table()
         self._refresh_kpis(now)
-        QMessageBox.information(self, "导入完成", f"成功识别并导入 {added_count} 个账号。")
+        msg_parts = []
+        if added_count > 0:
+            msg_parts.append(f"新增 {added_count} 个")
+        if updated_count > 0:
+            msg_parts.append(f"更新 {updated_count} 个已有账号")
+        summary_msg = "，".join(msg_parts) if msg_parts else "未识别到变更"
+        QMessageBox.information(self, "导入完成", f"批量文本处理完成：{summary_msg}。")
 
     def _on_edit_account(self, account_id: str) -> None:
         acc = self._find_account(account_id)
@@ -883,7 +930,11 @@ class MainWindow(QMainWindow):
         acc.password = form.password
         acc.two_fa = form.two_fa
 
-        events_5h = acc.update_five_hour_quota(form.five_hour_quota, now_ts=now)
+        events_5h = acc.update_five_hour_quota(
+            form.five_hour_quota,
+            clear_timer=form.clear_five_hour_timer,
+            now_ts=now,
+        )
         events_weekly = acc.set_weekly_quota_and_timer(
             new_quota=form.weekly_quota,
             reset_duration_seconds=form.weekly_reset_seconds if form.apply_weekly_timer else None,
@@ -914,7 +965,11 @@ class MainWindow(QMainWindow):
         res = dlg.result_data
         now = time.time()
 
-        events_5h = acc.update_five_hour_quota(res.five_hour_quota, now_ts=now)
+        events_5h = acc.update_five_hour_quota(
+            res.five_hour_quota,
+            clear_timer=res.clear_five_hour_timer,
+            now_ts=now,
+        )
         events_weekly = acc.set_weekly_quota_and_timer(
             new_quota=res.weekly_quota,
             reset_duration_seconds=res.weekly_reset_seconds if res.apply_weekly_timer else None,

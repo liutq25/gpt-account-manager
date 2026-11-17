@@ -18,7 +18,7 @@ def _resolve_resource(rel_path: str) -> Path:
     return base / rel_path
 
 
-def run_background_notification_check() -> int:
+def run_background_notification_check(storage: Optional[AccountStorage] = None) -> int:
     """
     Called by Windows Task Scheduler in the background (no GUI window).
     Silently loads data, checks for expiring weekly quotas, sends notifications if needed.
@@ -27,7 +27,8 @@ def run_background_notification_check() -> int:
     from src.models import check_weekly_expiring_accounts, format_duration
     from src.notifier import send_windows_toast
 
-    storage = AccountStorage()
+    if storage is None:
+        storage = AccountStorage()
     settings = storage.load_settings()
     if not settings.notify_enabled:
         return 0

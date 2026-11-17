@@ -16,17 +16,17 @@ MIN_QUOTA = 0
 
 _FOUR_DASH_PATTERN = re.compile(
     r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
-    r"\s*----\s*"
+    r"\s*(?:-{2,}|—{2,})\s*"
     r"([^\r\n]+?)"
-    r"\s*----\s*"
+    r"\s*(?:-{2,}|—{2,})\s*"
     r"([A-Za-z0-9=]+)"
 )
 
 _ALT_DELIM_PATTERN = re.compile(
     r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
-    r"\s*(?:\||\t)\s*"
-    r"([^\r\n|\t]+?)"
-    r"\s*(?:\||\t)\s*"
+    r"\s*(?:\||\t|:)\s*"
+    r"([^\r\n|\t:]+?)"
+    r"\s*(?:\||\t|:)\s*"
     r"([A-Za-z0-9=]+)"
 )
 
@@ -53,6 +53,8 @@ def parse_accounts_from_text(raw_text: str) -> List[ParsedAccount]:
     results: List[ParsedAccount] = []
     seen_keys: set[Tuple[str, str]] = set()
 
+    raw_matches: List[Tuple[int, ParsedAccount]] = []
+
     for pattern in (_FOUR_DASH_PATTERN, _ALT_DELIM_PATTERN):
         for match in pattern.finditer(text):
             email = match.group(1).strip()
@@ -65,16 +67,21 @@ def parse_accounts_from_text(raw_text: str) -> List[ParsedAccount]:
                 continue
             seen_keys.add(dedup_key)
             suggested = email.split("@", 1)[0]
-            results.append(
-                ParsedAccount(
-                    suggested_name=suggested,
-                    email=email,
-                    password=password,
-                    two_fa=two_fa,
+            raw_matches.append(
+                (
+                    match.start(),
+                    ParsedAccount(
+                        suggested_name=suggested,
+                        email=email,
+                        password=password,
+                        two_fa=two_fa,
+                    ),
                 )
             )
-        if results:
-            return results
+
+    if raw_matches:
+        raw_matches.sort(key=lambda item: item[0])
+        return [item[1] for item in raw_matches]
 
     # Fallback: labeled lines for a single account
     email_m = re.search(
@@ -222,28 +229,46 @@ class Account:
             updated_at=now,
         )
 
-    def update_five_hour_quota(self, new_quota: int, now_ts: Optional[float] = None) -> List[str]:
+    @property
+    def can_start_five_hour_usage(self) -> tuple[bool, str]:
         """
-        Update 5h quota and enforce:
-        - Transition to 0 (or 0 without active timer): start 5h countdown.
-        - Transition to >0: clear 5h countdown.
-        - Staying at 0 with an active timer: preserve existing countdown.
+        Check if 5h countdown can be started by user.
+        Returns (can_start: bool, reason: str).
+        """
+        if self.five_hour_reset_at is not None:
+            return False, "5h 倒计时正在运行中"
+        if self.weekly_quota <= 0:
+            return False, "周额度已耗尽 (0%)，无法开始使用"
+        if self.five_hour_quota <= 0:
+            return False, "5h 额度已为 0，正在等待重置"
+        return True, "可以开始使用"
+
+    def update_five_hour_quota(
+        self,
+        new_quota: int,
+        clear_timer: bool = False,
+        now_ts: Optional[float] = None,
+    ) -> List[str]:
+        """
+        Update 5h quota and enforce state consistency:
+        - If clear_timer is True, explicitly cancel existing 5h countdown.
+        - If already counting down and clear_timer is False, preserve existing reset timestamp.
+        - If not counting down and new_quota becomes 0, automatically start 5h countdown.
         Returns list of event tags triggered.
         """
         now = time.time() if now_ts is None else now_ts
         new_quota = validate_quota(new_quota, "5h额度")
         events: List[str] = []
 
-        old_quota = self.five_hour_quota
         self.five_hour_quota = new_quota
-        if new_quota == 0:
-            if old_quota != 0 or self.five_hour_reset_at is None:
-                self.five_hour_reset_at = now + FIVE_HOURS_SECONDS
-                events.append("START_5H_COUNTDOWN")
-        else:
+        if clear_timer:
             if self.five_hour_reset_at is not None:
                 self.five_hour_reset_at = None
                 events.append("CLEAR_5H_COUNTDOWN")
+        else:
+            if self.five_hour_reset_at is None and new_quota == 0:
+                self.five_hour_reset_at = now + FIVE_HOURS_SECONDS
+                events.append("START_5H_COUNTDOWN")
 
         self.updated_at = now
         return events
@@ -251,15 +276,18 @@ class Account:
     def start_five_hour_usage(self, now_ts: Optional[float] = None) -> List[str]:
         """
         Start 5h countdown immediately upon user action.
-        If already counting down, preserves existing reset timestamp.
+        Precondition: Weekly quota must have remaining balance (> 0) and 5h quota > 0,
+        and not already counting down.
         Returns triggered event list.
         """
+        can_start, reason = self.can_start_five_hour_usage
+        if not can_start:
+            raise ValueError(reason)
+
         now = time.time() if now_ts is None else now_ts
-        if self.five_hour_reset_at is None:
-            self.five_hour_reset_at = now + FIVE_HOURS_SECONDS
-            self.updated_at = now
-            return ["START_5H_COUNTDOWN"]
-        return []
+        self.five_hour_reset_at = now + FIVE_HOURS_SECONDS
+        self.updated_at = now
+        return ["START_5H_COUNTDOWN"]
 
     def set_weekly_quota_and_timer(
         self,
@@ -316,6 +344,7 @@ class Account:
         if self.weekly_reset_at is not None and now >= self.weekly_reset_at:
             self.weekly_quota = MAX_QUOTA
             self.weekly_reset_at = None
+            self.weekly_notified_reset_at = None
             self.updated_at = now
             triggered.append("AUTO_RESET_WEEKLY")
 
