@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 import shutil
+import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QColor, QFont
+from PyQt5.QtGui import QColor, QFont, QKeySequence, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QAction,
@@ -25,6 +29,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QShortcut,
     QStatusBar,
     QSystemTrayIcon,
     QTableWidget,
@@ -34,15 +39,42 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from src.dialogs import AccountDialog, BatchImportDialog, QuickQuotaDialog, SettingsDialog
+from src.dialogs import (
+    AccountDialog,
+    BatchImportDialog,
+    CodexLoginDialog,
+    OcrConfirmDialog,
+    PassphraseDialog,
+    QuickQuotaDialog,
+    SettingsDialog,
+)
+from src.codex_detector import (
+    CodexMonitor,
+    CodexProfile,
+    extract_codex_profile,
+)
+from src.launcher import (
+    SequentialPasteController,
+    copy_two_fa_with_expiry_guard,
+    launch_isolated_browser,
+)
+from src.mini_hud import MiniHudWindow, ScreenSnipOverlay
 from src.models import (
-    Account,
+    HEALTH_STATUS_LABELS,
     MAX_QUOTA,
+    VALID_PROVIDERS,
+    Account,
+    check_warranty_expiring_accounts,
     check_weekly_expiring_accounts,
     compute_totp,
+    compute_vendor_roi_stats,
+    format_after_sales_slip,
     format_duration,
+    select_optimal_account,
 )
 from src.notifier import send_windows_toast
+from src.ocr_sync import CodexAuthManager, parse_quota_from_ocr_text, run_windows_ocr
+from src.security import SecurityError
 from src.storage import AccountStorage, AppSettings, LogEntry
 from src.ui_styles import ThemePalette, build_stylesheet, get_palette
 
@@ -73,20 +105,49 @@ class MainWindow(QMainWindow):
         self._row_widgets: Dict[str, RowWidgets] = {}
         self._revealed_pwds: Set[str] = set()
         self._is_force_quitting: bool = False
+        self._focused_account_id: Optional[str] = None
+        self._snip_overlay: Optional[ScreenSnipOverlay] = None
 
-        self.setWindowTitle("GPT 账号额度管理助手")
-        self.resize(1380, 820)
-        self.setMinimumSize(1120, 680)
+        self.codex_mgr = CodexAuthManager(self.storage.codex_vault_dir)
+        self.codex_monitor = CodexMonitor(codex_home=self.codex_mgr.codex_dir, parent=self)
+        self.codex_monitor.profile_updated.connect(self._on_codex_profile_changed)
+        self._dismissed_codex_emails: Set[str] = set()
+        self._pending_codex_profile: Optional[CodexProfile] = None
+
+        self.paste_ctrl = SequentialPasteController(
+            self, burn_seconds=self.settings.clipboard_burn_seconds
+        )
+        self.paste_ctrl.state_changed.connect(self._on_paste_queue_state_changed)
+
+        self.mini_hud = MiniHudWindow(
+            on_dispatch=self._on_smart_dispatch,
+            on_advance_paste=self.paste_ctrl.advance,
+            on_snip_ocr=self._on_start_screen_snip_ocr,
+            on_expand_main=self._restore_from_tray,
+            palette=self._palette,
+        )
+
+        self.setWindowTitle("AI 多平台账号额度与防关联调度控制台 (v2.0)")
+        self.resize(1440, 840)
+        self.setMinimumSize(1160, 680)
 
         self._build_ui()
+        self._bind_shortcuts()
         self._init_system_tray()
         self._apply_theme(self.current_theme, persist=False, log_event=False)
         self._load_initial_data()
+        self.codex_monitor.check_now()
 
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(1000)
         self._tick_timer.timeout.connect(self._on_tick)
         self._tick_timer.start()
+
+    def _bind_shortcuts(self) -> None:
+        QShortcut(QKeySequence("Ctrl+Shift+D"), self, activated=self._on_smart_dispatch)
+        QShortcut(QKeySequence("Ctrl+1"), self, activated=self.paste_ctrl.copy_step_email)
+        QShortcut(QKeySequence("Ctrl+2"), self, activated=self.paste_ctrl.copy_step_password)
+        QShortcut(QKeySequence("Ctrl+3"), self, activated=self.paste_ctrl.copy_step_totp)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -101,13 +162,15 @@ class MainWindow(QMainWindow):
         header.setFixedHeight(64)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(20, 10, 20, 10)
-        header_layout.setSpacing(12)
+        header_layout.setSpacing(10)
 
         title_col = QVBoxLayout()
         title_col.setSpacing(2)
-        title_lbl = QLabel("GPT 账号额度管理控制台")
+        title_lbl = QLabel("AI 账号双窗额度与防关联调度控制台")
         title_lbl.setObjectName("AppTitle")
-        sub_lbl = QLabel("本地持久化存储 · 5h 额度自动恢复 · 周额度重置倒计时 · 智能文本识别 · 结构化审计日志")
+        sub_lbl = QLabel(
+            "DPAPI 系统级密文仓 · EEQF 防作废派号 · Chromium 独立代理隔离 · 离线 WinRT OCR 校准 · 质保 ROI 账本"
+        )
         sub_lbl.setObjectName("AppSubtitle")
         title_col.addWidget(title_lbl)
         title_col.addWidget(sub_lbl)
@@ -115,17 +178,29 @@ class MainWindow(QMainWindow):
         header_layout.addLayout(title_col)
         header_layout.addStretch()
 
+        self.hud_btn = QPushButton("🗔 置顶胶囊窗")
+        self.hud_btn.setObjectName("SettingsBtn")
+        self.hud_btn.setToolTip("打开/隐藏置顶微型悬浮胶囊，支持一键派号、三段吐码与框选 OCR")
+        self.hud_btn.clicked.connect(self._on_toggle_mini_hud)
+        header_layout.addWidget(self.hud_btn)
+
         self.theme_btn = QPushButton()
         self.theme_btn.setObjectName("ThemeToggleBtn")
-        self.theme_btn.setToolTip("在日间（白色背景）与夜间（黑色背景）之间切换")
+        self.theme_btn.setToolTip("切换日间（白色）与夜间（深色）模式")
         self.theme_btn.clicked.connect(self._on_toggle_theme)
         header_layout.addWidget(self.theme_btn)
 
-        self.settings_btn = QPushButton("⚙ 设置")
+        self.settings_btn = QPushButton("⚙ 设置与云同步")
         self.settings_btn.setObjectName("SettingsBtn")
-        self.settings_btn.setToolTip("配置周额度刷新预警、系统后台计划任务与托盘行为")
+        self.settings_btn.setToolTip("配置额度/质保提醒、后台计划任务、浏览器隔离与 WebDAV 加密同步")
         self.settings_btn.clicked.connect(self._on_open_settings)
         header_layout.addWidget(self.settings_btn)
+
+        self.codex_status_badge = QLabel("Codex: 检测中...")
+        self.codex_status_badge.setStyleSheet(
+            "color: #94A3B8; font-size: 11px; padding: 3px 8px; border-radius: 4px; border: 1px solid #334155;"
+        )
+        header_layout.addWidget(self.codex_status_badge)
 
         self.clock_label = QLabel("")
         self.clock_label.setStyleSheet(
@@ -143,8 +218,8 @@ class MainWindow(QMainWindow):
         # KPI Cards Row
         kpi_row = QHBoxLayout()
         kpi_row.setSpacing(12)
-        self.kpi_total = self._create_kpi_card("总账号数", "0")
-        self.kpi_5h_ready = self._create_kpi_card("5h 额度可用", "0")
+        self.kpi_total = self._create_kpi_card("总纳管账号", "0")
+        self.kpi_5h_ready = self._create_kpi_card("当前可派发 (5h&周>0)", "0")
         self.kpi_5h_cooling = self._create_kpi_card("5h 恢复倒计时中", "0")
         self.kpi_weekly_cooling = self._create_kpi_card("周额度倒计时中", "0")
         kpi_row.addWidget(self.kpi_total[0])
@@ -156,9 +231,12 @@ class MainWindow(QMainWindow):
         # Main Tabs
         self.tabs = QTabWidget()
         self.accounts_tab = self._build_accounts_tab()
+        self.roi_tab = self._build_roi_tab()
         self.logs_tab = self._build_logs_tab()
-        self.tabs.addTab(self.accounts_tab, "账号与额度管理")
-        self.tabs.addTab(self.logs_tab, "运行日志")
+        self.tabs.addTab(self.accounts_tab, "账号调度与额度管理")
+        self.tabs.addTab(self.roi_tab, "资产质保与渠道 ROI 统计")
+        self.tabs.addTab(self.logs_tab, "结构化审计日志")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         body_layout.addWidget(self.tabs)
 
         root.addWidget(body)
@@ -166,7 +244,7 @@ class MainWindow(QMainWindow):
         # Status Bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage(f"本地数据路径: {self.storage.accounts_file}")
+        self.status_bar.showMessage(f"本地加密数据仓: {self.storage.accounts_file}")
 
     def _create_kpi_card(self, title: str, initial_value: str) -> tuple[QFrame, QLabel, QLabel]:
         card = QFrame()
@@ -205,12 +283,10 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.setStyleSheet(build_stylesheet(self.current_theme))
 
-        if self.current_theme == "dark":
-            self.theme_btn.setText("日间模式 (白)")
-        else:
-            self.theme_btn.setText("夜间模式 (黑)")
-
+        self.theme_btn.setText("日间模式 (白)" if self.current_theme == "dark" else "夜间模式 (黑)")
         self._style_kpi_cards()
+        self._style_paste_banner()
+        self.mini_hud.apply_palette(self._palette)
 
         if persist:
             try:
@@ -220,16 +296,35 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "account_table") and self.accounts is not None:
             self._rebuild_account_table()
+        if hasattr(self, "roi_table") and self.accounts is not None:
+            self._refresh_roi_tab()
         if hasattr(self, "log_table"):
             self._refresh_log_table()
 
         if log_event:
-            mode_label = "夜间模式（黑色背景）" if self.current_theme == "dark" else "日间模式（白色背景）"
+            mode_label = "夜间模式（深色背景）" if self.current_theme == "dark" else "日间模式（浅色背景）"
             self._record_log("INFO", "THEME_CHANGED", f"界面主题已切换为：{mode_label}。")
 
     def _on_toggle_theme(self) -> None:
         next_theme = "dark" if self.current_theme == "light" else "light"
         self._apply_theme(next_theme, persist=True, log_event=True)
+
+    def _on_toggle_mini_hud(self) -> None:
+        if self.mini_hud.isVisible():
+            self.mini_hud.hide()
+        else:
+            prov_filter = (
+                self.provider_filter_combo.currentText()
+                if hasattr(self, "provider_filter_combo")
+                else "全部平台"
+            )
+            self.mini_hud.refresh_snapshot(
+                self.accounts,
+                self._focused_account_id,
+                provider_filter=prov_filter,
+            )
+            self.mini_hud.show()
+            self.mini_hud.raise_()
 
     def _build_accounts_tab(self) -> QWidget:
         tab = QWidget()
@@ -242,54 +337,144 @@ class MainWindow(QMainWindow):
         toolbar.setObjectName("ToolbarFrame")
         tb_layout = QHBoxLayout(toolbar)
         tb_layout.setContentsMargins(12, 10, 12, 10)
-        tb_layout.setSpacing(10)
+        tb_layout.setSpacing(8)
 
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("搜索账号名称或邮箱...")
-        self.search_input.setMaximumWidth(260)
+        self.search_input.setPlaceholderText("搜索名称、邮箱或渠道...")
+        self.search_input.setMaximumWidth(210)
         self.search_input.textChanged.connect(self._rebuild_account_table)
+
+        self.provider_filter_combo = QComboBox()
+        self.provider_filter_combo.addItems(["全部平台", *VALID_PROVIDERS])
+        self.provider_filter_combo.currentIndexChanged.connect(self._rebuild_account_table)
 
         self.filter_combo = QComboBox()
         self.filter_combo.addItems(
-            ["全部账号", "5h 额度 > 0", "5h 额度已耗尽 (倒计时中)", "周额度倒计时中"]
+            [
+                "全部状态",
+                "5h 额度 > 0 (可用)",
+                "5h 额度倒计时中",
+                "周额度倒计时中",
+                "异常/封禁/质保临期",
+            ]
         )
         self.filter_combo.currentIndexChanged.connect(self._rebuild_account_table)
 
-        tb_layout.addWidget(QLabel("筛选:"))
         tb_layout.addWidget(self.search_input)
+        tb_layout.addWidget(self.provider_filter_combo)
         tb_layout.addWidget(self.filter_combo)
         tb_layout.addStretch()
 
-        export_btn = QPushButton("备份导出")
-        export_btn.clicked.connect(self._on_export_backup)
-        tb_layout.addWidget(export_btn)
+        # Smart Dispatch Button (EEQF)
+        dispatch_btn = QPushButton("⚡ 智能派号 (EEQF)")
+        dispatch_btn.setObjectName("PrimaryButton")
+        dispatch_btn.setToolTip(
+            "按「最早过期周额度优先」算法一键选出最紧急可用账号，自动启动 5h 倒计时并装载上号队列 (Ctrl+Shift+D)"
+        )
+        dispatch_btn.clicked.connect(self._on_smart_dispatch)
+        tb_layout.addWidget(dispatch_btn)
 
-        batch_btn = QPushButton("批量文本识别导入")
-        batch_btn.setToolTip("粘贴一段或多段账号文本，自动识别邮箱、密码与 2FA 初始验证码")
+        # Offline OCR Menu Button
+        ocr_btn = QPushButton("📷 离线OCR校准")
+        ocr_menu = QMenu(ocr_btn)
+        ocr_menu.addAction("框选屏幕网页区域识别", self._on_start_screen_snip_ocr)
+        ocr_menu.addAction("从系统剪贴板截图识别 (Win+Shift+S)", self._on_clipboard_ocr)
+        ocr_menu.addAction("选择本地截图文件识别...", self._on_file_ocr)
+        ocr_btn.setMenu(ocr_menu)
+        tb_layout.addWidget(ocr_btn)
+
+        # Backup & Sync Menu Button
+        backup_btn = QPushButton("🔐 加密备份/恢复")
+        backup_menu = QMenu(backup_btn)
+        backup_menu.addAction("导出跨设备 AES-256 加密备份...", self._on_export_encrypted_backup)
+        backup_menu.addAction("导入加密/历史备份并智能合并...", self._on_import_backup_merge)
+        backup_menu.addSeparator()
+        backup_menu.addAction("导出本地原文件备份...", self._on_export_backup)
+        backup_btn.setMenu(backup_menu)
+        tb_layout.addWidget(backup_btn)
+
+        batch_btn = QPushButton("批量识别导入")
         batch_btn.clicked.connect(self._on_batch_import)
         tb_layout.addWidget(batch_btn)
 
-        add_btn = QPushButton("+ 添加 GPT 账号")
+        add_btn = QPushButton("+ 添加账号")
         add_btn.setObjectName("PrimaryButton")
         add_btn.clicked.connect(self._on_add_account)
         tb_layout.addWidget(add_btn)
 
+        codex_login_btn = QPushButton("⚡ 官方登录新号")
+        codex_login_btn.setObjectName("PrimaryButton")
+        codex_login_btn.setToolTip("通过官方 OAuth 登录网页，完成后免密全自动提取账号凭据与会员状态")
+        codex_login_btn.clicked.connect(self._on_codex_login_ingest)
+        tb_layout.addWidget(codex_login_btn)
+
         layout.addWidget(toolbar)
+
+        # Codex Auto-Detection Banner (shows when unmanaged Codex account detected)
+        self.codex_banner = QFrame()
+        self.codex_banner.setVisible(False)
+        self.codex_banner.setObjectName("CodexAlertBanner")
+        cb_lay = QHBoxLayout(self.codex_banner)
+        cb_lay.setContentsMargins(12, 8, 12, 8)
+        cb_lay.setSpacing(10)
+
+        self.codex_banner_lbl = QLabel("")
+        self.codex_banner_lbl.setStyleSheet("font-weight: 600; font-size: 12px;")
+        self.codex_ingest_btn = QPushButton("⚡ 一键自动纳管")
+        self.codex_ingest_btn.setObjectName("PrimaryButton")
+        self.codex_ingest_btn.clicked.connect(self._on_ingest_current_codex)
+        self.codex_dismiss_btn = QPushButton("忽略")
+        self.codex_dismiss_btn.clicked.connect(self._on_dismiss_codex_banner)
+
+        cb_lay.addWidget(self.codex_banner_lbl, 1)
+        cb_lay.addWidget(self.codex_ingest_btn)
+        cb_lay.addWidget(self.codex_dismiss_btn)
+        layout.addWidget(self.codex_banner)
+
+        # Sequential Paste Queue Interactive Banner (hidden when IDLE)
+        self.paste_banner = QFrame()
+        self.paste_banner.setVisible(False)
+        pb_lay = QHBoxLayout(self.paste_banner)
+        pb_lay.setContentsMargins(12, 8, 12, 8)
+        pb_lay.setSpacing(8)
+
+        self.paste_msg_lbl = QLabel("")
+        self.paste_msg_lbl.setStyleSheet("font-weight: 700; font-size: 12px;")
+
+        btn_s1 = QPushButton("1.邮箱 (Ctrl+1)")
+        btn_s1.clicked.connect(self.paste_ctrl.copy_step_email)
+        btn_s2 = QPushButton("2.密码 (Ctrl+2)")
+        btn_s2.clicked.connect(self.paste_ctrl.copy_step_password)
+        btn_s3 = QPushButton("3.防过期2FA (Ctrl+3)")
+        btn_s3.clicked.connect(self.paste_ctrl.copy_step_totp)
+        btn_next = QPushButton("▶ 下一步")
+        btn_next.setObjectName("PrimaryButton")
+        btn_next.clicked.connect(self.paste_ctrl.advance)
+        btn_cancel = QPushButton("🔥 清空退出")
+        btn_cancel.clicked.connect(lambda: self.paste_ctrl.cancel(burn_now=True))
+
+        pb_lay.addWidget(self.paste_msg_lbl, 1)
+        pb_lay.addWidget(btn_s1)
+        pb_lay.addWidget(btn_s2)
+        pb_lay.addWidget(btn_s3)
+        pb_lay.addWidget(btn_next)
+        pb_lay.addWidget(btn_cancel)
+        layout.addWidget(self.paste_banner)
 
         # Account Table
         self.account_table = QTableWidget()
         self.account_table.setColumnCount(9)
         self.account_table.setHorizontalHeaderLabels(
             [
-                "账号名称",
+                "平台 / 账号名称",
                 "账号邮箱",
                 "登录密码",
-                "2FA 验证码",
+                "2FA 动态/初始码",
                 "5h 剩余额度",
                 "5h 重置倒计时",
                 "周剩余额度",
                 "周重置倒计时",
-                "操作",
+                "防关联与管理操作",
             ]
         )
         self.account_table.setAlternatingRowColors(True)
@@ -301,24 +486,84 @@ class MainWindow(QMainWindow):
         header = self.account_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Interactive)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.Fixed)
-        header.setSectionResizeMode(4, QHeaderView.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.Interactive)
         header.setSectionResizeMode(5, QHeaderView.Fixed)
-        header.setSectionResizeMode(6, QHeaderView.Fixed)
+        header.setSectionResizeMode(6, QHeaderView.Interactive)
         header.setSectionResizeMode(7, QHeaderView.Fixed)
         header.setSectionResizeMode(8, QHeaderView.Fixed)
 
-        self.account_table.setColumnWidth(0, 130)
+        self.account_table.setColumnWidth(0, 175)
         self.account_table.setColumnWidth(2, 165)
-        self.account_table.setColumnWidth(3, 175)
+        self.account_table.setColumnWidth(3, 155)
         self.account_table.setColumnWidth(4, 215)
-        self.account_table.setColumnWidth(5, 135)
-        self.account_table.setColumnWidth(6, 125)
-        self.account_table.setColumnWidth(7, 145)
-        self.account_table.setColumnWidth(8, 175)
+        self.account_table.setColumnWidth(5, 112)
+        self.account_table.setColumnWidth(6, 130)
+        self.account_table.setColumnWidth(7, 128)
+        self.account_table.setColumnWidth(8, 224)
 
-        layout.addWidget(self.account_table)
+        layout.addWidget(self.account_table, 1)
+        return tab
+
+    def _style_paste_banner(self) -> None:
+        p = self._palette
+        if hasattr(self, "paste_banner"):
+            self.paste_banner.setStyleSheet(
+                f"QFrame {{ background-color: {p.info_bg}; border: 1px solid {p.info_border}; border-radius: 8px; }}"
+            )
+            self.paste_msg_lbl.setStyleSheet(f"color: {p.info_text}; font-weight: 700; font-size: 12px;")
+
+        if hasattr(self, "codex_banner"):
+            self.codex_banner.setStyleSheet(
+                f"QFrame#CodexAlertBanner {{ background-color: {p.surface_bg}; "
+                f"border: 1px solid {p.primary_border}; border-left: 4px solid {p.primary_bg}; "
+                f"border-radius: 8px; }}"
+            )
+            if hasattr(self, "codex_banner_lbl"):
+                self.codex_banner_lbl.setStyleSheet(f"color: {p.text_primary}; font-weight: 600; font-size: 12px;")
+
+    def _build_roi_tab(self) -> QWidget:
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(10)
+
+        top_bar = QFrame()
+        top_bar.setObjectName("ToolbarFrame")
+        tb = QHBoxLayout(top_bar)
+        tb.setContentsMargins(12, 10, 12, 10)
+        tb.setSpacing(12)
+
+        self.roi_summary_lbl = QLabel("渠道存活率与投入成本统计")
+        self.roi_summary_lbl.setStyleSheet("font-weight: 700; font-size: 13px;")
+        tb.addWidget(self.roi_summary_lbl, 1)
+
+        slip_btn = QPushButton("📋 一键复制异常/封禁号售后凭条")
+        slip_btn.setObjectName("PrimaryButton")
+        slip_btn.clicked.connect(self._on_copy_after_sales_slip)
+        tb.addWidget(slip_btn)
+        lay.addWidget(top_bar)
+
+        self.roi_table = QTableWidget()
+        self.roi_table.setColumnCount(8)
+        self.roi_table.setHorizontalHeaderLabels(
+            [
+                "来源渠道标签",
+                "总购入账号数",
+                "正常可用数",
+                "已封禁数",
+                "封号折损率",
+                "累计采购成本",
+                "累计5h会话轮次",
+                "单轮5h摊销均价",
+            ]
+        )
+        self.roi_table.setAlternatingRowColors(True)
+        self.roi_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.roi_table.verticalHeader().setVisible(False)
+        self.roi_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        lay.addWidget(self.roi_table, 1)
         return tab
 
     def _build_logs_tab(self) -> QWidget:
@@ -327,124 +572,141 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        bar = QHBoxLayout()
+        bar = QFrame()
+        bar.setObjectName("ToolbarFrame")
+        bar_lay = QHBoxLayout(bar)
+        bar_lay.setContentsMargins(12, 10, 12, 10)
+        bar_lay.setSpacing(10)
+
         self.log_level_combo = QComboBox()
         self.log_level_combo.addItems(["全部级别", "INFO", "WARN", "ERROR"])
         self.log_level_combo.currentIndexChanged.connect(self._refresh_log_table)
 
         self.log_search_input = QLineEdit()
-        self.log_search_input.setPlaceholderText("搜索日志内容或账号...")
+        self.log_search_input.setPlaceholderText("搜索日志事件、账号或详情...")
         self.log_search_input.setMaximumWidth(280)
         self.log_search_input.textChanged.connect(self._refresh_log_table)
 
-        refresh_btn = QPushButton("刷新")
-        refresh_btn.clicked.connect(self._refresh_log_table)
+        bar_lay.addWidget(QLabel("级别:"))
+        bar_lay.addWidget(self.log_level_combo)
+        bar_lay.addWidget(self.log_search_input)
+        bar_lay.addStretch()
+
         export_log_btn = QPushButton("导出日志")
         export_log_btn.clicked.connect(self._on_export_logs)
         clear_log_btn = QPushButton("清空日志")
         clear_log_btn.setObjectName("DangerButton")
         clear_log_btn.clicked.connect(self._on_clear_logs)
-
-        bar.addWidget(QLabel("级别:"))
-        bar.addWidget(self.log_level_combo)
-        bar.addWidget(self.log_search_input)
-        bar.addStretch()
-        bar.addWidget(refresh_btn)
-        bar.addWidget(export_log_btn)
-        bar.addWidget(clear_log_btn)
-        layout.addLayout(bar)
+        bar_lay.addWidget(export_log_btn)
+        bar_lay.addWidget(clear_log_btn)
+        layout.addWidget(bar)
 
         self.log_table = QTableWidget()
         self.log_table.setColumnCount(6)
-        self.log_table.setHorizontalHeaderLabels(["时间", "Trace ID", "级别", "事件类型", "关联账号", "详细信息"])
+        self.log_table.setHorizontalHeaderLabels(
+            ["时间戳", "Trace ID", "级别", "事件类型", "关联账号", "操作与状态详情"]
+        )
         self.log_table.setAlternatingRowColors(True)
-        self.log_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.log_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.log_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.log_table.verticalHeader().setVisible(False)
+
         lh = self.log_table.horizontalHeader()
         lh.setSectionResizeMode(0, QHeaderView.Fixed)
         lh.setSectionResizeMode(1, QHeaderView.Fixed)
         lh.setSectionResizeMode(2, QHeaderView.Fixed)
         lh.setSectionResizeMode(3, QHeaderView.Fixed)
-        lh.setSectionResizeMode(4, QHeaderView.Fixed)
+        lh.setSectionResizeMode(4, QHeaderView.Interactive)
         lh.setSectionResizeMode(5, QHeaderView.Stretch)
         self.log_table.setColumnWidth(0, 155)
-        self.log_table.setColumnWidth(1, 85)
+        self.log_table.setColumnWidth(1, 90)
         self.log_table.setColumnWidth(2, 70)
-        self.log_table.setColumnWidth(3, 175)
-        self.log_table.setColumnWidth(4, 170)
+        self.log_table.setColumnWidth(3, 185)
+        self.log_table.setColumnWidth(4, 190)
 
-        layout.addWidget(self.log_table)
+        layout.addWidget(self.log_table, 1)
         return tab
 
+    def _on_tab_changed(self, idx: int) -> None:
+        if idx == 1:
+            self._refresh_roi_tab()
+        elif idx == 2:
+            self._refresh_log_table()
+
     def _load_initial_data(self) -> None:
+        now = time.time()
         try:
             self.accounts = self.storage.load_accounts()
         except Exception as exc:
-            self.storage.logger.log("ERROR", "LOAD_FAILED", f"读取本地账号数据失败: {exc}")
-            QMessageBox.critical(
-                self,
-                "数据加载错误",
-                f"无法解析本地数据文件：{self.storage.accounts_file}\n错误详情：{exc}",
-            )
             self.accounts = []
+            self._record_log("ERROR", "STORAGE_LOAD_ERROR", f"读取本地账号数据失败: {exc}")
+            QMessageBox.critical(self, "数据加载异常", f"读取本地数据文件时发生异常：\n{exc}")
 
-        self._record_log("INFO", "APP_START", f"程序启动，已加载 {len(self.accounts)} 个账号。")
-
-        now = time.time()
-        changed = False
+        any_reset = False
         for acc in self.accounts:
             triggered = acc.tick(now)
             if triggered:
-                changed = True
+                any_reset = True
                 for ev in triggered:
                     self._log_auto_reset(acc, ev, catch_up=True)
 
-        if changed:
+        if any_reset:
             self._save_accounts_safe()
 
+        self._record_log("INFO", "APP_START", f"软件启动完成，共加载 {len(self.accounts)} 个账号。")
         self._rebuild_account_table()
+        self._refresh_roi_tab()
         self._refresh_kpis(now)
         self._refresh_log_table()
-
-    def _record_log(self, level: str, event: str, detail: str, account: str = "-") -> None:
-        self.storage.logger.log(level=level, event=event, detail=detail, account=account)
-        if hasattr(self, "log_table"):
-            self._refresh_log_table()
-        if hasattr(self, "status_bar"):
-            self.status_bar.showMessage(f"[{event}] {detail}  |  数据文件: {self.storage.accounts_file}", 6000)
-
-    def _log_auto_reset(self, acc: Account, event_code: str, catch_up: bool = False) -> None:
-        prefix = "离线到期补齐：" if catch_up else ""
-        acc_ref = f"{acc.name} ({acc.email})"
-        if event_code == "AUTO_RESET_5H":
-            self._record_log("INFO", "AUTO_RESET_5H", f"{prefix}5h 倒计时结束，5h 额度已自动恢复为 100。", acc_ref)
-        elif event_code == "AUTO_RESET_WEEKLY":
-            self._record_log("INFO", "AUTO_RESET_WEEKLY", f"{prefix}周额度倒计时结束，周额度已自动恢复为 100。", acc_ref)
 
     def _save_accounts_safe(self) -> None:
         try:
             self.storage.save_accounts(self.accounts)
         except Exception as exc:
-            self._record_log("ERROR", "SAVE_FAILED", f"保存本地数据失败: {exc}")
-            QMessageBox.critical(self, "保存失败", f"写入本地数据失败：{exc}")
+            self._record_log("ERROR", "STORAGE_SAVE_ERROR", f"保存本地账号数据失败: {exc}")
+            QMessageBox.critical(self, "保存失败", f"写入本地数据文件失败：\n{exc}")
+
+    def _record_log(self, level: str, event: str, detail: str, account: str = "-") -> None:
+        self.storage.logger.log(level=level, event=event, detail=detail, account=account)
+        if hasattr(self, "log_table"):
+            self._refresh_log_table()
+
+    def _log_auto_reset(self, acc: Account, ev_code: str, catch_up: bool) -> None:
+        prefix = "离线期间倒计时已到期，" if catch_up else "倒计时结束，"
+        acc_ref = f"[{acc.provider}] {acc.name} ({acc.email})"
+        if ev_code == "AUTO_RESET_5H":
+            self._record_log("INFO", "AUTO_RESET_5H", f"{prefix}5h 额度已自动恢复为 100。", acc_ref)
+        elif ev_code == "AUTO_RESET_WEEKLY":
+            self._record_log("INFO", "AUTO_RESET_WEEKLY", f"{prefix}周额度已自动恢复为 100。", acc_ref)
 
     def _filtered_accounts(self) -> List[Account]:
         kw = self.search_input.text().strip().lower()
+        prov_sel = self.provider_filter_combo.currentText() if hasattr(self, "provider_filter_combo") else "全部平台"
         mode = self.filter_combo.currentIndex()
         now = time.time()
-        result: List[Account] = []
+        out: List[Account] = []
         for acc in self.accounts:
-            if kw and kw not in acc.name.lower() and kw not in acc.email.lower():
+            if prov_sel != "全部平台" and acc.provider != prov_sel:
                 continue
-            if mode == 1 and acc.five_hour_quota <= 0:
+            if kw and (
+                kw not in acc.name.lower()
+                and kw not in acc.email.lower()
+                and kw not in acc.vendor_tag.lower()
+            ):
+                continue
+            if mode == 1 and (acc.five_hour_quota <= 0 or acc.health_status == "BANNED"):
                 continue
             if mode == 2 and acc.five_hour_reset_at is None:
                 continue
-            if mode == 3 and (acc.weekly_reset_at is None or acc.weekly_remaining_seconds(now) == 0):
+            if mode == 3 and acc.weekly_reset_at is None:
                 continue
-            result.append(acc)
-        return result
+            if mode == 4:
+                w_rem = acc.warranty_remaining_seconds(now)
+                is_warranty_soon = w_rem is not None and 0 < w_rem <= 48 * 3600
+                if acc.health_status == "ACTIVE" and not is_warranty_soon:
+                    continue
+            out.append(acc)
+        return out
 
     def _rebuild_account_table(self) -> None:
         p = self._palette
@@ -452,16 +714,51 @@ class MainWindow(QMainWindow):
         self._row_widgets.clear()
         self.account_table.setRowCount(len(visible))
         now = time.time()
+        if hasattr(self, "mini_hud") and self.mini_hud.isVisible():
+            prov_filter = (
+                self.provider_filter_combo.currentText()
+                if hasattr(self, "provider_filter_combo")
+                else "全部平台"
+            )
+            self.mini_hud.refresh_snapshot(
+                self.accounts,
+                self._focused_account_id,
+                now_ts=now,
+                provider_filter=prov_filter,
+            )
 
         for row_idx, acc in enumerate(visible):
-            self.account_table.setRowHeight(row_idx, 52)
+            self.account_table.setRowHeight(row_idx, 54)
 
-            # Col 0: Name
-            name_item = QTableWidgetItem(acc.name)
+            # Col 0: Provider + Name + Health/Proxy badges
+            tags: List[str] = [f"[{acc.provider}]"]
+            if acc.health_status != "ACTIVE":
+                tags.append(f"[{HEALTH_STATUS_LABELS.get(acc.health_status, acc.health_status)}]")
+            if acc.proxy_url:
+                tags.append("[代理]")
+            display_name = f"{''.join(tags)} {acc.name}"
+            name_item = QTableWidgetItem(display_name)
             bold_font = QFont()
             bold_font.setBold(True)
             name_item.setFont(bold_font)
-            name_item.setForeground(QColor(p.text_primary))
+            if acc.health_status == "BANNED":
+                name_item.setForeground(QColor(p.danger_text))
+            elif acc.health_status in ("DEGRADED_POW", "PHONE_VERIFY"):
+                name_item.setForeground(QColor(p.warn_text))
+            else:
+                name_item.setForeground(QColor(p.text_primary))
+
+            tip_parts = [f"平台: {acc.provider}", f"状态: {HEALTH_STATUS_LABELS.get(acc.health_status)}"]
+            if acc.vendor_tag:
+                tip_parts.append(f"渠道: {acc.vendor_tag} (¥{acc.purchase_price:.2f})")
+            if acc.proxy_url:
+                tip_parts.append(f"独立代理: {acc.proxy_url}")
+            w_rem = acc.warranty_remaining_seconds(now)
+            if w_rem is not None:
+                tip_parts.append(f"质保剩余: {format_duration(w_rem)}" if w_rem > 0 else "质保: 已过保")
+            if acc.notes:
+                tip_parts.append(f"备注: {acc.notes}")
+            name_item.setToolTip("\n".join(tip_parts))
             self.account_table.setItem(row_idx, 0, name_item)
 
             # Col 1: Email + copy
@@ -471,7 +768,7 @@ class MainWindow(QMainWindow):
             )
             self.account_table.setCellWidget(row_idx, 1, email_cell)
 
-            # Col 2: Password (masked/revealed + toggle + copy)
+            # Col 2: Password
             is_rev = acc.id in self._revealed_pwds
             pwd_cell = QWidget()
             pwd_lay = QHBoxLayout(pwd_cell)
@@ -490,7 +787,7 @@ class MainWindow(QMainWindow):
             pwd_lay.addWidget(pwd_copy)
             self.account_table.setCellWidget(row_idx, 2, pwd_cell)
 
-            # Col 3: 2FA + copy
+            # Col 3: 2FA + expiry-safe copy
             two_fa_cell = QWidget()
             tfa_lay = QHBoxLayout(two_fa_cell)
             tfa_lay.setContentsMargins(6, 4, 6, 4)
@@ -522,7 +819,6 @@ class MainWindow(QMainWindow):
                 f"font-family: 'Consolas', monospace; font-weight: 700; color: {p.text_primary};"
             )
             start_5h_btn = QPushButton("开始使用")
-            start_5h_btn.setToolTip("开始使用并立即启动 5 小时倒计时（5 小时后自动恢复为 100 额度）")
             start_5h_btn.clicked.connect(lambda _=False, aid=acc.id: self._on_start_5h_usage(aid))
 
             zero_btn = QPushButton("归0")
@@ -567,26 +863,58 @@ class MainWindow(QMainWindow):
             w_timer_lbl.setAlignment(Qt.AlignCenter)
             self.account_table.setCellWidget(row_idx, 7, w_timer_lbl)
 
-            # Col 8: Actions
+            # Col 8: Actions (Launch/Paste Menu + Quota + Edit + Delete)
             act_cell = QWidget()
             act_lay = QHBoxLayout(act_cell)
-            act_lay.setContentsMargins(6, 4, 6, 4)
+            act_lay.setContentsMargins(4, 4, 4, 4)
             act_lay.setSpacing(4)
+
+            launch_btn = QPushButton("上号▾")
+            launch_btn.setStyleSheet(
+                f"padding: 3px 6px; font-size: 11px; background-color: {p.primary_bg}; "
+                f"border: none; color: #FFFFFF; font-weight: 700;"
+            )
+            l_menu = QMenu(launch_btn)
+            l_menu.addAction(
+                "🌐 隔离浏览器启动 + 顺序吐码",
+                lambda aid=acc.id: self._on_launch_isolated_and_paste(aid),
+            )
+            l_menu.addAction(
+                "📋 仅启动三段式顺序吐码队列",
+                lambda aid=acc.id: self._on_start_paste_only(aid),
+            )
+            l_menu.addSeparator()
+            has_snap = self.codex_mgr.has_snapshot(acc.id)
+            snap_mark = " (已绑定)" if has_snap else ""
+            l_menu.addAction(
+                f"⚡ 切换本地 ~/.codex 授权为此号{snap_mark}",
+                lambda aid=acc.id: self._on_activate_codex_auth(aid),
+            )
+            l_menu.addAction(
+                "💾 捕获当前 ~/.codex/auth.json 绑定到此号",
+                lambda aid=acc.id: self._on_capture_codex_auth(aid),
+            )
+            launch_btn.setMenu(l_menu)
+
             quota_btn = QPushButton("改额度")
             quota_btn.setStyleSheet(
-                f"padding: 3px 7px; font-size: 11px; background-color: {p.info_bg}; "
+                f"padding: 3px 6px; font-size: 11px; background-color: {p.info_bg}; "
                 f"border: 1px solid {p.info_border}; color: {p.info_text};"
             )
             quota_btn.clicked.connect(lambda _=False, aid=acc.id: self._on_quick_quota(aid))
+
             edit_btn = QPushButton("编辑")
-            edit_btn.setStyleSheet("padding: 3px 7px; font-size: 11px;")
+            edit_btn.setStyleSheet("padding: 3px 6px; font-size: 11px;")
             edit_btn.clicked.connect(lambda _=False, aid=acc.id: self._on_edit_account(aid))
+
             del_btn = QPushButton("删除")
             del_btn.setStyleSheet(
-                f"padding: 3px 7px; font-size: 11px; background-color: {p.danger_bg}; "
+                f"padding: 3px 6px; font-size: 11px; background-color: {p.danger_bg}; "
                 f"border: 1px solid {p.danger_border}; color: {p.danger_text};"
             )
             del_btn.clicked.connect(lambda _=False, aid=acc.id: self._on_delete_account(aid))
+
+            act_lay.addWidget(launch_btn)
             act_lay.addWidget(quota_btn)
             act_lay.addWidget(edit_btn)
             act_lay.addWidget(del_btn)
@@ -639,11 +967,10 @@ class MainWindow(QMainWindow):
 
     def _update_row_live_state(self, acc: Account, rw: RowWidgets, now: float) -> None:
         p = self._palette
-        # 5h quota
         rw.five_bar.setValue(acc.five_hour_quota)
         self._set_bar_color(rw.five_bar, acc.five_hour_quota)
         rw.five_label.setText(f"{acc.five_hour_quota}%")
-        rw.zero_btn.setEnabled(acc.five_hour_quota > 0)
+        rw.zero_btn.setEnabled(acc.five_hour_quota > 0 and acc.health_status not in ("BANNED", "PHONE_VERIFY"))
 
         five_rem = acc.five_hour_remaining_seconds(now)
         if five_rem is not None:
@@ -662,7 +989,11 @@ class MainWindow(QMainWindow):
         else:
             can_start, reason = acc.can_start_five_hour_usage
             if not can_start:
-                if acc.weekly_quota <= 0:
+                if acc.health_status == "BANNED":
+                    btn_text = "已封禁"
+                elif acc.health_status == "PHONE_VERIFY":
+                    btn_text = "待接码"
+                elif acc.weekly_quota <= 0:
                     btn_text = "无周额度"
                 elif acc.five_hour_quota <= 0:
                     btn_text = "额度为0"
@@ -678,7 +1009,10 @@ class MainWindow(QMainWindow):
             else:
                 rw.start_5h_btn.setText("开始使用")
                 rw.start_5h_btn.setEnabled(True)
-                rw.start_5h_btn.setToolTip("开始使用并立即启动 5 小时倒计时（5 小时后自动恢复为 100 额度）")
+                urg = acc.burn_urgency_score(now)
+                rw.start_5h_btn.setToolTip(
+                    f"立即启动 5 小时倒计时（EEQF 防过期紧急度: {urg:.2f}%/h）"
+                )
                 rw.start_5h_btn.setStyleSheet(
                     f"padding: 2px 6px; font-size: 11px; background-color: {p.primary_bg}; "
                     f"color: #FFFFFF; border: none; border-radius: 4px; font-weight: 600;"
@@ -686,7 +1020,6 @@ class MainWindow(QMainWindow):
             rw.five_timer_label.setText("未触发")
             rw.five_timer_label.setStyleSheet(f"color: {p.text_muted}; font-size: 12px;")
 
-        # Weekly quota
         rw.weekly_bar.setValue(acc.weekly_quota)
         self._set_bar_color(rw.weekly_bar, acc.weekly_quota)
         rw.weekly_label.setText(f"{acc.weekly_quota}%")
@@ -702,11 +1035,18 @@ class MainWindow(QMainWindow):
             rw.weekly_timer_label.setText("未设置")
             rw.weekly_timer_label.setStyleSheet(f"color: {p.text_muted}; font-size: 12px;")
 
-        # 2FA live TOTP or static initial code
         totp_code, totp_rem = compute_totp(acc.two_fa, now)
         if totp_code is not None:
             rw.two_fa_label.setText(f"{totp_code} ({totp_rem:02d}s)")
-            rw.two_fa_label.setToolTip("根据 Base32 密钥实时计算的 6 位 TOTP 验证码")
+            if totp_rem <= 3:
+                rw.two_fa_label.setStyleSheet(
+                    f"font-family: 'Consolas', monospace; font-weight: 700; color: {p.warn_text};"
+                )
+            else:
+                rw.two_fa_label.setStyleSheet(
+                    f"font-family: 'Consolas', monospace; font-weight: 600; color: {p.text_primary};"
+                )
+            rw.two_fa_label.setToolTip("实时 6 位 TOTP 验证码（点击复制时若剩余 ≤3s 将自动顺延获取下一周期新码）")
         else:
             rw.two_fa_label.setText(acc.two_fa)
             rw.two_fa_label.setToolTip("初始/静态 2FA 验证码")
@@ -714,7 +1054,13 @@ class MainWindow(QMainWindow):
     def _refresh_kpis(self, now: Optional[float] = None) -> None:
         ts = time.time() if now is None else now
         total = len(self.accounts)
-        ready_5h = sum(1 for a in self.accounts if a.five_hour_quota > 0)
+        ready_5h = sum(
+            1
+            for a in self.accounts
+            if a.five_hour_quota > 0
+            and a.weekly_quota > 0
+            and a.health_status in ("ACTIVE", "DEGRADED_POW")
+        )
         cooling_5h = sum(1 for a in self.accounts if a.five_hour_reset_at is not None)
         cooling_weekly = sum(
             1
@@ -725,7 +1071,432 @@ class MainWindow(QMainWindow):
         self.kpi_5h_ready[2].setText(str(ready_5h))
         self.kpi_5h_cooling[2].setText(str(cooling_5h))
         self.kpi_weekly_cooling[2].setText(str(cooling_weekly))
+        if self.mini_hud.isVisible():
+            prov_filter = (
+                self.provider_filter_combo.currentText()
+                if hasattr(self, "provider_filter_combo")
+                else "全部平台"
+            )
+            self.mini_hud.refresh_snapshot(
+                self.accounts,
+                self._focused_account_id,
+                now_ts=ts,
+                provider_filter=prov_filter,
+            )
 
+    def _refresh_roi_tab(self) -> None:
+        if not hasattr(self, "roi_table"):
+            return
+        p = self._palette
+        rows = compute_vendor_roi_stats(self.accounts)
+        self.roi_table.setRowCount(len(rows))
+
+        total_spend = sum(r.total_cost for r in rows)
+        total_accs = len(self.accounts)
+        total_banned = sum(r.banned_count for r in rows)
+        now = time.time()
+        warranty_soon = len(check_warranty_expiring_accounts(self.accounts, hours_threshold=48, now_ts=now))
+        self.roi_summary_lbl.setText(
+            f"总纳管: {total_accs} 个 | 累计购号成本: ¥{total_spend:.2f} | "
+            f"已封禁折损: {total_banned} 个 | 48h内质保临期: {warranty_soon} 个"
+        )
+
+        for idx, r in enumerate(rows):
+            self.roi_table.setRowHeight(idx, 36)
+            cps_str = f"¥{r.cost_per_session:.2f} / 轮" if r.cost_per_session is not None else "-"
+            vals = [
+                r.vendor,
+                str(r.total_count),
+                str(r.active_count),
+                str(r.banned_count),
+                f"{r.ban_rate_pct:.1f}%",
+                f"¥{r.total_cost:.2f}",
+                str(r.total_5h_sessions),
+                cps_str,
+            ]
+            for c_i, txt in enumerate(vals):
+                item = QTableWidgetItem(txt)
+                item.setTextAlignment(Qt.AlignCenter if c_i > 0 else (Qt.AlignLeft | Qt.AlignVCenter))
+                if c_i == 4 and r.ban_rate_pct >= 30.0:
+                    item.setForeground(QColor(p.danger_text))
+                else:
+                    item.setForeground(QColor(p.text_primary))
+                self.roi_table.setItem(idx, c_i, item)
+
+    # ------------------------------------------------------------------
+    # Core Feature Actions: Smart Dispatch, Isolated Browser, Paste, OCR
+    # ------------------------------------------------------------------
+    def _on_smart_dispatch(self) -> None:
+        now = time.time()
+        prov_filter = (
+            self.provider_filter_combo.currentText()
+            if hasattr(self, "provider_filter_combo")
+            else "全部平台"
+        )
+        rec = select_optimal_account(self.accounts, provider=prov_filter, now_ts=now)
+        if rec.account is None:
+            QMessageBox.information(self, "智能派号结果", rec.reason)
+            return
+
+        acc = rec.account
+        self._focused_account_id = acc.id
+        if rec.status == "READY_NEW_5H":
+            acc.start_five_hour_usage(now_ts=now)
+            self._save_accounts_safe()
+            self._record_log(
+                "INFO",
+                "EEQF_SMART_DISPATCH",
+                f"{rec.reason}；已自动启动 5h 倒计时并装载上号队列。",
+                f"[{acc.provider}] {acc.name}",
+            )
+            self.paste_ctrl.start(acc)
+            self._rebuild_account_table()
+            self._refresh_kpis(now)
+            self._highlight_account_row(acc.id)
+            self.status_bar.showMessage(f"⚡ 已派发最优账号「{acc.name}」：{rec.reason}", 8000)
+        elif rec.status == "ACTIVE_WINDOW_REUSE":
+            self.paste_ctrl.start(acc)
+            self._highlight_account_row(acc.id)
+            self.status_bar.showMessage(f"⚡ 复用当前活跃会话「{acc.name}」：{rec.reason}", 8000)
+        else:
+            QMessageBox.information(self, "全部冷却中", rec.reason)
+
+    def _highlight_account_row(self, account_id: str) -> None:
+        visible = self._filtered_accounts()
+        for r_idx, a in enumerate(visible):
+            if a.id == account_id:
+                self.account_table.selectRow(r_idx)
+                item = self.account_table.item(r_idx, 0)
+                if item is not None:
+                    self.account_table.scrollToItem(item)
+                break
+
+    def _on_paste_queue_state_changed(self, state_code: str, message: str) -> None:
+        if state_code == "IDLE":
+            self.paste_banner.setVisible(False)
+            if message:
+                self.status_bar.showMessage(message, 5000)
+        else:
+            self.paste_msg_lbl.setText(message)
+            self.paste_banner.setVisible(True)
+        self.mini_hud.update_paste_queue_state(state_code, message)
+
+    def _on_start_paste_only(self, account_id: str) -> None:
+        acc = self._find_account(account_id)
+        if acc is None:
+            return
+        self._focused_account_id = acc.id
+        self.paste_ctrl.start(acc)
+        self._record_log("INFO", "PASTE_QUEUE_STARTED", "已启动三段式顺序吐码队列。", f"{acc.name} ({acc.email})")
+
+    def _on_launch_isolated_and_paste(self, account_id: str) -> None:
+        acc = self._find_account(account_id)
+        if acc is None:
+            return
+        try:
+            prof_dir = launch_isolated_browser(
+                acc,
+                profiles_root=self.storage.profiles_dir,
+                custom_browser_path=self.settings.custom_browser_path,
+            )
+        except Exception as err:
+            self._record_log("ERROR", "BROWSER_LAUNCH_FAILED", str(err), f"{acc.name}")
+            QMessageBox.warning(self, "隔离浏览器启动失败", str(err))
+            return
+
+        self._focused_account_id = acc.id
+        self.paste_ctrl.start(acc)
+        proxy_note = f"，独立代理={acc.proxy_url}" if acc.proxy_url else "，直连"
+        self._record_log(
+            "INFO",
+            "ISOLATED_BROWSER_LAUNCHED",
+            f"已启动隔离浏览器实例（目录: {prof_dir.name}{proxy_note}）并就绪邮箱粘贴。",
+            f"[{acc.provider}] {acc.name}",
+        )
+        self.status_bar.showMessage(
+            f"🌐 已为「{acc.name}」打开独立防关联浏览器窗口，邮箱已自动写入剪贴板！", 7000
+        )
+
+    def _on_capture_codex_auth(self, account_id: str) -> None:
+        acc = self._find_account(account_id)
+        if acc is None:
+            return
+        try:
+            dest = self.codex_mgr.capture_current_auth(acc.id)
+            self._record_log(
+                "INFO",
+                "CODEX_AUTH_CAPTURED",
+                f"已捕获 ~/.codex/auth.json 并通过 DPAPI 加密绑定至快照 ({dest.name})。",
+                f"{acc.name}",
+            )
+            self._rebuild_account_table()
+            QMessageBox.information(
+                self, "绑定成功", f"已将当前 ~/.codex/auth.json 加密绑定至账号「{acc.name}」。"
+            )
+        except Exception as err:
+            QMessageBox.warning(self, "捕获 Codex 授权失败", str(err))
+
+    def _on_activate_codex_auth(self, account_id: str) -> None:
+        acc = self._find_account(account_id)
+        if acc is None:
+            return
+        try:
+            target_auth = self.codex_mgr.activate_snapshot(acc.id)
+            self._focused_account_id = acc.id
+            self._record_log(
+                "INFO",
+                "CODEX_AUTH_SWITCHED",
+                f"已原子切换 {target_auth} 为当前账号授权（原文件已备份为 auth.json.bak）。",
+                f"{acc.name}",
+            )
+            QMessageBox.information(
+                self, "切换成功", f"已将本地 Codex CLI 授权切换为账号「{acc.name}」。"
+            )
+        except Exception as err:
+            QMessageBox.warning(self, "切换 Codex 授权失败", str(err))
+
+    def _on_codex_profile_changed(self, profile: Optional[CodexProfile]) -> None:
+        if profile is None:
+            if hasattr(self, "codex_status_badge"):
+                self.codex_status_badge.setText("Codex: ⚪ 未登录")
+                self.codex_status_badge.setStyleSheet(
+                    "color: #94A3B8; font-size: 11px; padding: 3px 8px; border-radius: 4px; border: 1px solid #334155;"
+                )
+            if hasattr(self, "codex_banner"):
+                self.codex_banner.setVisible(False)
+            self._pending_codex_profile = None
+            return
+
+        plan_desc = profile.display_plan
+        email = profile.email
+        if hasattr(self, "codex_status_badge"):
+            self.codex_status_badge.setText(f"Codex: 🟢 {email} ({plan_desc})")
+            self.codex_status_badge.setStyleSheet(
+                "color: #10B981; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 4px; border: 1px solid #059669;"
+            )
+
+        # Check if already in accounts
+        matched: Optional[Account] = None
+        for acc in self.accounts:
+            if acc.email.strip().lower() == email.strip().lower():
+                matched = acc
+                break
+
+        if matched is not None:
+            if hasattr(self, "codex_banner"):
+                self.codex_banner.setVisible(False)
+            self._pending_codex_profile = None
+            if not self.codex_mgr.has_snapshot(matched.id):
+                try:
+                    self.codex_mgr.capture_current_auth(matched.id)
+                    self._record_log("INFO", "CODEX_AUTO_SNAPSHOT", f"自动同步已纳管账号「{matched.name}」的 Codex 快照。")
+                except Exception:
+                    pass
+            if matched.warranty_expire_at is None and profile.subscription_expire_timestamp is not None:
+                matched.warranty_expire_at = profile.subscription_expire_timestamp
+                matched.updated_at = time.time()
+                self._save_accounts_safe()
+                self._rebuild_account_table()
+        else:
+            self._pending_codex_profile = profile
+            if email.lower() not in self._dismissed_codex_emails and hasattr(self, "codex_banner"):
+                self.codex_banner_lbl.setText(
+                    f"🔍 检测到宿主机 Codex 已登录新账号：{email} ({plan_desc})，尚未纳入本系统管理。"
+                )
+                self.codex_banner.setVisible(True)
+
+    def _on_ingest_current_codex(self) -> None:
+        prof = self._pending_codex_profile or self.codex_monitor.current_profile
+        if prof is None:
+            QMessageBox.information(self, "未检测到账号", "当前宿主机未检测到有效登录的 Codex 账号。")
+            return
+        self._auto_ingest_codex_profile(prof)
+
+    def _on_dismiss_codex_banner(self) -> None:
+        if self._pending_codex_profile:
+            self._dismissed_codex_emails.add(self._pending_codex_profile.email.lower())
+        if hasattr(self, "codex_banner"):
+            self.codex_banner.setVisible(False)
+
+    def _on_codex_login_ingest(self) -> None:
+        dlg = CodexLoginDialog(monitor=self.codex_monitor, parent=self, palette=self._palette)
+        if dlg.exec_() == QDialog.Accepted and dlg.captured_profile:
+            self._auto_ingest_codex_profile(dlg.captured_profile)
+
+    def _auto_ingest_codex_profile(self, profile: CodexProfile) -> None:
+        for acc in self.accounts:
+            if acc.email.strip().lower() == profile.email.strip().lower():
+                QMessageBox.information(
+                    self,
+                    "账号已存在",
+                    f"账号「{profile.email}」已在管理列表中，名称为「{acc.name}」，已为您自动同步最新授权快照。",
+                )
+                try:
+                    self.codex_mgr.capture_current_auth(acc.id)
+                except Exception:
+                    pass
+                if hasattr(self, "codex_banner"):
+                    self.codex_banner.setVisible(False)
+                return
+
+        new_id = uuid.uuid4().hex[:12]
+        display_name = profile.name.strip() if profile.name.strip() else profile.email.split("@")[0]
+        acc_name = f"{display_name} (Codex {profile.display_plan})"
+        new_acc = Account(
+            id=new_id,
+            name=acc_name,
+            email=profile.email,
+            password="[Codex_OAuth_Token]",
+            two_fa="CODEX_OAUTH_SESSION",
+            five_hour_quota=100,
+            weekly_quota=100,
+            provider="Codex",
+            warranty_expire_at=profile.subscription_expire_timestamp,
+            notes=f"从系统 Codex CLI 自动捕获。Plan: {profile.plan_type}, ID: {profile.account_id}",
+            created_at=time.time(),
+            updated_at=time.time(),
+        )
+
+        try:
+            self.codex_mgr.capture_current_auth(new_acc.id)
+        except Exception as err:
+            self._record_log("WARN", "CODEX_SNAP_WARN", f"绑定 Codex 授权快照警告: {err}")
+
+        self.accounts.append(new_acc)
+        self._save_accounts_safe()
+        self._focused_account_id = new_acc.id
+        self._rebuild_account_table()
+        self._refresh_kpis()
+
+        if hasattr(self, "codex_banner"):
+            self.codex_banner.setVisible(False)
+
+        self._record_log(
+            "INFO",
+            "CODEX_AUTO_INGESTED",
+            f"已自动纳管系统 Codex 账号「{acc_name}」({profile.email})，免密捕获成功。",
+            f"{acc_name}",
+        )
+
+        send_windows_toast(
+            "Codex 账号自动录入成功",
+            f"已自动获取并纳管：{profile.email} ({profile.display_plan})\n凭据已加密保存，无需手动输入！",
+        )
+        QMessageBox.information(
+            self,
+            "自动录入成功",
+            f"已成功捕获并纳管 Codex 账号：\n\n"
+            f"• 账号名称: {new_acc.name}\n"
+            f"• 登录邮箱: {new_acc.email}\n"
+            f"• 订阅计划: {profile.display_plan}\n"
+            f"• 授权凭据: 已通过 DPAPI 系统级密文快照归档\n\n"
+            f"您现在可以在账号列表中随时一键切换使用此账号！",
+        )
+
+    def _on_start_screen_snip_ocr(self) -> None:
+        if not self.accounts:
+            QMessageBox.information(self, "提示", "请先添加至少一个账号后再执行 OCR 额度校准。")
+            return
+        self._snip_overlay = ScreenSnipOverlay(self)
+        self._snip_overlay.snip_captured.connect(self._process_ocr_pixmap)
+        self._snip_overlay.show()
+
+    def _on_clipboard_ocr(self) -> None:
+        if not self.accounts:
+            QMessageBox.information(self, "提示", "请先添加至少一个账号。")
+            return
+        cb = QApplication.clipboard()
+        pix = cb.pixmap() if cb is not None else QPixmap()
+        if pix.isNull():
+            QMessageBox.warning(
+                self,
+                "剪贴板无图片",
+                "当前系统剪贴板中没有图像数据。\n您可以先按 Win+Shift+S 截取网页额度区域，或直接使用「框选屏幕网页区域识别」。",
+            )
+            return
+        self._process_ocr_pixmap(pix)
+
+    def _on_file_ocr(self) -> None:
+        if not self.accounts:
+            QMessageBox.information(self, "提示", "请先添加至少一个账号。")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择包含额度信息的截图文件", "", "Images (*.png *.jpg *.jpeg *.bmp)"
+        )
+        if not path:
+            return
+        self._run_ocr_on_file(Path(path))
+
+    def _process_ocr_pixmap(self, pixmap: QPixmap) -> None:
+        if pixmap.isNull():
+            return
+        fd_path = Path(tempfile.gettempdir()) / f"gpt_mgr_ocr_{int(time.time() * 1000)}.png"
+        try:
+            pixmap.save(str(fd_path), "PNG")
+            self._run_ocr_on_file(fd_path)
+        finally:
+            fd_path.unlink(missing_ok=True)
+
+    def _run_ocr_on_file(self, image_path: Path) -> None:
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            raw_text = run_windows_ocr(image_path)
+            parsed = parse_quota_from_ocr_text(raw_text)
+        except Exception as err:
+            QApplication.restoreOverrideCursor()
+            self._record_log("ERROR", "OCR_FAILED", str(err))
+            QMessageBox.warning(self, "离线 OCR 识别失败", str(err))
+            return
+        finally:
+            while QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
+
+        dlg = OcrConfirmDialog(
+            accounts=self.accounts,
+            ocr_result=parsed,
+            default_account_id=self._focused_account_id,
+            parent=self,
+            palette=self._palette,
+        )
+        if dlg.exec_() != QDialog.Accepted or dlg.apply_result is None:
+            return
+
+        res = dlg.apply_result
+        acc = self._find_account(res.account_id)
+        if acc is None:
+            return
+        now = time.time()
+        if res.apply_five_hour:
+            acc.update_five_hour_quota(res.five_hour_quota, now_ts=now)
+        if res.apply_weekly or res.apply_weekly_timer:
+            new_w = res.weekly_quota if res.apply_weekly else acc.weekly_quota
+            dur = res.weekly_reset_seconds if res.apply_weekly_timer else None
+            acc.set_weekly_quota_and_timer(new_quota=new_w, reset_duration_seconds=dur, now_ts=now)
+
+        self._save_accounts_safe()
+        self._record_log(
+            "INFO",
+            "OCR_QUOTA_SYNCED",
+            f"通过离线 WinRT OCR 回填额度：5h={acc.five_hour_quota}%，周={acc.weekly_quota}%。",
+            f"[{acc.provider}] {acc.name}",
+        )
+        self._rebuild_account_table()
+        self._refresh_kpis(now)
+
+    def _on_copy_after_sales_slip(self) -> None:
+        slip = format_after_sales_slip(self.accounts)
+        if not slip:
+            QMessageBox.information(
+                self, "无异常账号", "当前没有状态为「已封禁 / 待接码 / 疑似降智」的账号记录。"
+            )
+            return
+        QApplication.clipboard().setText(slip)
+        self._record_log("INFO", "AFTER_SALES_SLIP_COPIED", "已生成并复制异常账号标准化售后凭条。")
+        QMessageBox.information(self, "售后凭条已复制", f"已复制到剪贴板：\n\n{slip[:600]}")
+
+    # ------------------------------------------------------------------
+    # Standard Account & Tick Operations
+    # ------------------------------------------------------------------
     def _on_start_5h_usage(self, account_id: str) -> None:
         acc = self._find_account(account_id)
         if acc is None:
@@ -738,8 +1509,9 @@ class MainWindow(QMainWindow):
         try:
             events = acc.start_five_hour_usage(now)
             if events:
+                self._focused_account_id = acc.id
                 self._save_accounts_safe()
-                acc_ref = f"{acc.name} ({acc.email})"
+                acc_ref = f"[{acc.provider}] {acc.name} ({acc.email})"
                 self._record_log(
                     "INFO",
                     "USAGE_5H_STARTED",
@@ -747,6 +1519,7 @@ class MainWindow(QMainWindow):
                     acc_ref,
                 )
                 self._rebuild_account_table()
+                self._refresh_roi_tab()
                 self._refresh_kpis(now)
         except ValueError as err:
             QMessageBox.warning(self, "无法开始使用", str(err))
@@ -755,15 +1528,15 @@ class MainWindow(QMainWindow):
         now = time.time()
         self.clock_label.setText(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-        any_reset = False
+        any_dirty = False
         for acc in self.accounts:
             triggered = acc.tick(now)
             if triggered:
-                any_reset = True
+                any_dirty = True
                 for ev in triggered:
                     self._log_auto_reset(acc, ev, catch_up=False)
 
-        # Weekly quota expiry notification check
+        # 1. Weekly quota expiry notification check
         if getattr(self, "settings", None) and self.settings.notify_enabled:
             expiring = check_weekly_expiring_accounts(
                 self.accounts,
@@ -771,17 +1544,32 @@ class MainWindow(QMainWindow):
                 hours_threshold=self.settings.notify_hours_threshold,
                 now_ts=now,
             )
-            if expiring:
-                for acc in expiring:
-                    acc.weekly_notified_reset_at = acc.weekly_reset_at
-                    rem_str = format_duration(acc.weekly_remaining_seconds(now) or 0)
-                    title = "GPT 账号周额度即将刷新提醒"
-                    msg = f"账号「{acc.name}」周额度还剩 {acc.weekly_quota}%，将在 {rem_str} 后重置，请及时使用！"
-                    self._notify_user(title, msg)
-                    self._record_log("WARN", "WEEKLY_EXPIRING_NOTIFICATION", msg, f"{acc.name} ({acc.email})")
-                any_reset = True
+            for acc in expiring:
+                acc.weekly_notified_reset_at = acc.weekly_reset_at
+                rem_str = format_duration(acc.weekly_remaining_seconds(now) or 0)
+                title = f"{acc.provider} 账号周额度即将刷新提醒"
+                msg = f"账号「{acc.name}」周额度还剩 {acc.weekly_quota}%，将在 {rem_str} 后重置，请及时使用！"
+                self._notify_user(title, msg)
+                self._record_log("WARN", "WEEKLY_EXPIRING_NOTIFICATION", msg, f"{acc.name} ({acc.email})")
+                any_dirty = True
 
-        if any_reset:
+        # 2. Warranty expiry notification check
+        if getattr(self, "settings", None) and self.settings.warranty_notify_enabled:
+            w_expiring = check_warranty_expiring_accounts(
+                self.accounts,
+                hours_threshold=self.settings.warranty_notify_hours,
+                now_ts=now,
+            )
+            for acc in w_expiring:
+                acc.warranty_notified_at = acc.warranty_expire_at
+                rem_str = format_duration(acc.warranty_remaining_seconds(now) or 0)
+                title = "外购账号质保即将到期验号提醒"
+                msg = f"账号「{acc.name}」({acc.vendor_tag or '外购'}) 质保仅剩 {rem_str}，请尽快登录验号排查封禁！"
+                self._notify_user(title, msg)
+                self._record_log("WARN", "WARRANTY_EXPIRING_NOTIFICATION", msg, f"{acc.name} ({acc.email})")
+                any_dirty = True
+
+        if any_dirty:
             self._save_accounts_safe()
             if self.filter_combo.currentIndex() != 0:
                 self._rebuild_account_table()
@@ -815,21 +1603,24 @@ class MainWindow(QMainWindow):
 
     def _copy_text(self, text: str, label: str, acc: Account, sensitive: bool = False) -> None:
         QApplication.clipboard().setText(text)
-        acc_ref = f"{acc.name} ({acc.email})"
+        acc_ref = f"[{acc.provider}] {acc.name} ({acc.email})"
         detail = f"已复制{label}到剪贴板。" if sensitive else f"已复制{label} ({text}) 到剪贴板。"
         self._record_log("INFO", "CLIPBOARD_COPY", detail, acc_ref)
 
     def _copy_two_fa(self, acc: Account) -> None:
-        totp_code, _ = compute_totp(acc.two_fa, time.time())
-        value_to_copy = totp_code if totp_code is not None else acc.two_fa
-        QApplication.clipboard().setText(value_to_copy)
-        acc_ref = f"{acc.name} ({acc.email})"
-        kind = "实时 6 位 TOTP 验证码" if totp_code is not None else "2FA 初始验证码"
-        self._record_log("INFO", "CLIPBOARD_COPY", f"已复制{kind}到剪贴板。", acc_ref)
+        acc_ref = f"[{acc.provider}] {acc.name} ({acc.email})"
+
+        def _done(val: str, is_totp: bool, waited: bool) -> None:
+            kind = "实时 6 位 TOTP 验证码" if is_totp else "2FA 初始验证码"
+            wait_note = "（检测到临期 ≤3s，已自动顺延获取全新周期验证码）" if waited else ""
+            self._record_log("INFO", "CLIPBOARD_COPY", f"已复制{kind}{wait_note}。", acc_ref)
+            self.status_bar.showMessage(f"已复制「{acc.name}」{kind}{wait_note}", 5000)
+
+        copy_two_fa_with_expiry_guard(acc, on_done=_done, min_remaining_sec=3, parent=self)
 
     def _on_add_account(self) -> None:
         dlg = AccountDialog(self, palette=self._palette)
-        if dlg.exec_() != AccountDialog.Accepted or dlg.result_data is None:
+        if dlg.exec_() != QDialog.Accepted or dlg.result_data is None:
             return
         form = dlg.result_data
         now = time.time()
@@ -841,26 +1632,27 @@ class MainWindow(QMainWindow):
             five_hour_quota=form.five_hour_quota,
             weekly_quota=form.weekly_quota,
             weekly_reset_duration_seconds=form.weekly_reset_seconds if form.apply_weekly_timer else 0,
+            provider=form.provider,
+            proxy_url=form.proxy_url,
+            purchase_price=form.purchase_price,
+            warranty_days=form.warranty_days if form.apply_warranty_timer else 0.0,
+            vendor_tag=form.vendor_tag,
+            health_status=form.health_status,
+            notes=form.notes,
             now_ts=now,
         )
         self.accounts.append(acc)
         self._save_accounts_safe()
 
-        acc_ref = f"{acc.name} ({acc.email})"
-        timer_notes: List[str] = []
-        if acc.five_hour_reset_at is not None:
-            timer_notes.append("5h额度为0，已启动5小时倒计时")
-        if acc.weekly_reset_at is not None:
-            timer_notes.append(f"已启动周额度倒计时 ({format_duration(form.weekly_reset_seconds)})")
-        suffix = f"；{', '.join(timer_notes)}" if timer_notes else ""
+        acc_ref = f"[{acc.provider}] {acc.name} ({acc.email})"
         self._record_log(
             "INFO",
             "ACCOUNT_ADDED",
-            f"新增账号：5h额度={acc.five_hour_quota}，周额度={acc.weekly_quota}{suffix}。",
+            f"新增账号：平台={acc.provider}，5h={acc.five_hour_quota}%，周={acc.weekly_quota}%。",
             acc_ref,
         )
-
         self._rebuild_account_table()
+        self._refresh_roi_tab()
         self._refresh_kpis(now)
 
     def _on_batch_import(self) -> None:
@@ -871,18 +1663,38 @@ class MainWindow(QMainWindow):
         added_count = 0
         updated_count = 0
         for item in dlg.imported_items:
-            # 奇葩用户防御：若列表中已存在相同邮箱的账号，更新凭据而非盲目追加重复项
-            existing = next((a for a in self.accounts if a.email.strip().lower() == item.email.strip().lower()), None)
+            item_prov = getattr(item, "provider", "ChatGPT") or "ChatGPT"
+            item_vendor = getattr(item, "vendor_tag", "") or ""
+            item_price = float(getattr(item, "purchase_price", 0.0) or 0.0)
+            item_warranty = float(getattr(item, "warranty_days", 0.0) or 0.0)
+
+            existing = next(
+                (
+                    a
+                    for a in self.accounts
+                    if a.email.strip().lower() == item.email.strip().lower()
+                    and a.provider.lower() == item_prov.lower()
+                ),
+                None,
+            )
             if existing is not None:
                 existing.name = item.name
                 existing.password = item.password
                 existing.two_fa = item.two_fa
+                if item_vendor:
+                    existing.vendor_tag = item_vendor
+                if item_price > 0:
+                    existing.purchase_price = item_price
+                if item_warranty > 0:
+                    existing.warranty_expire_at = now + item_warranty * 86400.0
+                    existing.warranty_notified_at = None
+                existing.updated_at = now
                 updated_count += 1
                 self._record_log(
                     "INFO",
                     "ACCOUNT_BATCH_UPDATED",
-                    f"智能文本批量更新已有账号凭据：5h={existing.five_hour_quota}，周={existing.weekly_quota}。",
-                    f"{existing.name} ({existing.email})",
+                    f"批量更新已有账号凭据：5h={existing.five_hour_quota}%，周={existing.weekly_quota}%。",
+                    f"[{existing.provider}] {existing.name} ({existing.email})",
                 )
             else:
                 acc = Account.create(
@@ -893,6 +1705,10 @@ class MainWindow(QMainWindow):
                     five_hour_quota=item.five_hour_quota,
                     weekly_quota=item.weekly_quota,
                     weekly_reset_duration_seconds=0,
+                    provider=item_prov,
+                    vendor_tag=item_vendor,
+                    purchase_price=item_price,
+                    warranty_days=item_warranty,
                     now_ts=now,
                 )
                 self.accounts.append(acc)
@@ -900,12 +1716,13 @@ class MainWindow(QMainWindow):
                 self._record_log(
                     "INFO",
                     "ACCOUNT_BATCH_IMPORTED",
-                    f"智能文本导入新账号：5h={acc.five_hour_quota}，周={acc.weekly_quota}。",
-                    f"{acc.name} ({acc.email})",
+                    f"批量导入新账号：平台={acc.provider}，5h={acc.five_hour_quota}%，周={acc.weekly_quota}%。",
+                    f"[{acc.provider}] {acc.name} ({acc.email})",
                 )
 
         self._save_accounts_safe()
         self._rebuild_account_table()
+        self._refresh_roi_tab()
         self._refresh_kpis(now)
         msg_parts = []
         if added_count > 0:
@@ -920,7 +1737,7 @@ class MainWindow(QMainWindow):
         if acc is None:
             return
         dlg = AccountDialog(self, account=acc, palette=self._palette)
-        if dlg.exec_() != AccountDialog.Accepted or dlg.result_data is None:
+        if dlg.exec_() != QDialog.Accepted or dlg.result_data is None:
             return
         form = dlg.result_data
         now = time.time()
@@ -929,6 +1746,19 @@ class MainWindow(QMainWindow):
         acc.email = form.email
         acc.password = form.password
         acc.two_fa = form.two_fa
+        acc.provider = form.provider
+        acc.proxy_url = form.proxy_url
+        acc.purchase_price = form.purchase_price
+        acc.vendor_tag = form.vendor_tag
+        acc.health_status = form.health_status
+        acc.notes = form.notes
+
+        if form.clear_warranty_timer:
+            acc.warranty_expire_at = None
+            acc.warranty_notified_at = None
+        elif form.apply_warranty_timer and form.warranty_days > 0:
+            acc.warranty_expire_at = now + form.warranty_days * 86400.0
+            acc.warranty_notified_at = None
 
         events_5h = acc.update_five_hour_quota(
             form.five_hour_quota,
@@ -943,16 +1773,17 @@ class MainWindow(QMainWindow):
         )
 
         self._save_accounts_safe()
-        acc_ref = f"{acc.name} ({acc.email})"
+        acc_ref = f"[{acc.provider}] {acc.name} ({acc.email})"
         all_events = events_5h + events_weekly
         event_note = f"；触发状态: {', '.join(all_events)}" if all_events else ""
         self._record_log(
             "INFO",
             "ACCOUNT_UPDATED",
-            f"编辑账号：5h额度={acc.five_hour_quota}，周额度={acc.weekly_quota}{event_note}。",
+            f"编辑账号：状态={acc.health_status}，5h={acc.five_hour_quota}%，周={acc.weekly_quota}%{event_note}。",
             acc_ref,
         )
         self._rebuild_account_table()
+        self._refresh_roi_tab()
         self._refresh_kpis(now)
 
     def _on_quick_quota(self, account_id: str) -> None:
@@ -960,10 +1791,13 @@ class MainWindow(QMainWindow):
         if acc is None:
             return
         dlg = QuickQuotaDialog(acc, self, palette=self._palette)
-        if dlg.exec_() != QuickQuotaDialog.Accepted or dlg.result_data is None:
+        if dlg.exec_() != QDialog.Accepted or dlg.result_data is None:
             return
         res = dlg.result_data
         now = time.time()
+
+        if res.health_status:
+            acc.health_status = res.health_status
 
         events_5h = acc.update_five_hour_quota(
             res.five_hour_quota,
@@ -978,7 +1812,7 @@ class MainWindow(QMainWindow):
         )
         self._save_accounts_safe()
 
-        acc_ref = f"{acc.name} ({acc.email})"
+        acc_ref = f"[{acc.provider}] {acc.name} ({acc.email})"
         notes: List[str] = []
         if "START_5H_COUNTDOWN" in events_5h:
             notes.append("启动5h重置倒计时")
@@ -990,10 +1824,11 @@ class MainWindow(QMainWindow):
         self._record_log(
             "INFO",
             "QUOTA_UPDATED",
-            f"手动更新额度：5h={acc.five_hour_quota}，周={acc.weekly_quota}{extra}。",
+            f"手动更新额度：状态={acc.health_status}，5h={acc.five_hour_quota}%，周={acc.weekly_quota}%{extra}。",
             acc_ref,
         )
         self._rebuild_account_table()
+        self._refresh_roi_tab()
         self._refresh_kpis(now)
 
     def _on_quick_zero_5h(self, account_id: str) -> None:
@@ -1004,7 +1839,7 @@ class MainWindow(QMainWindow):
         acc.update_five_hour_quota(0, now_ts=now)
         self._save_accounts_safe()
 
-        acc_ref = f"{acc.name} ({acc.email})"
+        acc_ref = f"[{acc.provider}] {acc.name} ({acc.email})"
         self._record_log(
             "INFO",
             "QUOTA_5H_ZERO",
@@ -1012,6 +1847,7 @@ class MainWindow(QMainWindow):
             acc_ref,
         )
         self._rebuild_account_table()
+        self._refresh_roi_tab()
         self._refresh_kpis(now)
 
     def _on_delete_account(self, account_id: str) -> None:
@@ -1030,11 +1866,160 @@ class MainWindow(QMainWindow):
 
         self.accounts = [a for a in self.accounts if a.id != account_id]
         self._revealed_pwds.discard(account_id)
+        if self.paste_ctrl.active_account and self.paste_ctrl.active_account.id == account_id:
+            self.paste_ctrl.cancel(burn_now=True)
         self._save_accounts_safe()
         self._record_log("WARN", "ACCOUNT_DELETED", "已删除该账号记录。", f"{acc.name} ({acc.email})")
         self._rebuild_account_table()
+        self._refresh_roi_tab()
         self._refresh_kpis(time.time())
 
+    # ------------------------------------------------------------------
+    # Encrypted Portable Backup & WebDAV Cloud Sync
+    # ------------------------------------------------------------------
+    def _on_export_encrypted_backup(self) -> None:
+        pw_dlg = PassphraseDialog(
+            "导出跨设备 AES-256-GCM 加密备份",
+            "设置加密口令后，生成的备份文件采用 PBKDF2-HMAC-SHA256 (60万轮) + AES-256-GCM 端到端加密，可安全存放网盘或跨电脑恢复：",
+            require_confirm=True,
+            parent=self,
+        )
+        if pw_dlg.exec_() != QDialog.Accepted:
+            return
+        default_name = f"ai_accounts_e2ee_{datetime.now().strftime('%Y%m%d_%H%M%S')}.enc.json"
+        target, _ = QFileDialog.getSaveFileName(
+            self, "保存跨设备加密备份", default_name, "Encrypted JSON (*.enc.json *.json)"
+        )
+        if not target:
+            return
+        try:
+            self.storage.export_portable_backup(self.accounts, Path(target), pw_dlg.passphrase)
+            self._record_log("INFO", "ENCRYPTED_BACKUP_EXPORTED", f"已导出 AES-256-GCM 加密备份至: {target}")
+            QMessageBox.information(self, "加密导出成功", f"跨设备加密备份已保存至：\n{target}")
+        except Exception as err:
+            QMessageBox.critical(self, "导出失败", str(err))
+
+    def _on_import_backup_merge(self) -> None:
+        src, _ = QFileDialog.getOpenFileName(
+            self, "选择备份文件导入合并", "", "Backup Files (*.json *.enc.json)"
+        )
+        if not src:
+            return
+        src_path = Path(src)
+        is_encrypted = False
+        try:
+            top_obj = json.loads(src_path.read_text(encoding="utf-8").strip() or "{}")
+            if isinstance(top_obj, dict) and (
+                top_obj.get("magic") == "GPT_MANAGER_ENCRYPTED_BACKUP_V2"
+                or ("kdf" in top_obj and "ciphertext" in top_obj)
+            ):
+                is_encrypted = True
+        except Exception:
+            is_encrypted = False
+
+        passphrase = ""
+        if is_encrypted:
+            pw_dlg = PassphraseDialog(
+                "输入解密口令",
+                "检测到 AES-256-GCM 跨设备加密备份，请输入导出时设置的加密口令：",
+                require_confirm=False,
+                parent=self,
+            )
+            if pw_dlg.exec_() != QDialog.Accepted:
+                return
+            passphrase = pw_dlg.passphrase
+
+        try:
+            merged, added, updated, kept = self.storage.import_backup_merge(
+                src_path, self.accounts, passphrase=passphrase
+            )
+            self.accounts = merged
+            self._record_log(
+                "INFO",
+                "BACKUP_IMPORT_MERGED",
+                f"成功合并备份：新增 {added} 个，更新 {updated} 个，保留本地较新记录 {kept} 个。",
+            )
+            self._rebuild_account_table()
+            self._refresh_roi_tab()
+            self._refresh_kpis(time.time())
+            QMessageBox.information(
+                self,
+                "备份合并成功",
+                f"智能合并完成（基于 updated_at 最新状态优先）：\n"
+                f"• 新增账号：{added} 个\n• 更新账号：{updated} 个\n• 保留本地较新状态：{kept} 个",
+            )
+        except (SecurityError, ValueError, Exception) as err:
+            QMessageBox.warning(self, "导入备份失败", str(err))
+
+    def _on_export_backup(self) -> None:
+        default_name = f"gpt_accounts_local_dpapi_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        target, _ = QFileDialog.getSaveFileName(
+            self, "导出本机 DPAPI 备份副本", default_name, "JSON Files (*.json)"
+        )
+        if not target:
+            return
+        self._save_accounts_safe()
+        shutil.copy2(self.storage.accounts_file, target)
+        self._record_log("INFO", "BACKUP_EXPORTED", f"已导出本机 DPAPI 数据备份至: {target}")
+        QMessageBox.information(self, "导出成功", f"本机备份已保存至：\n{target}")
+
+    def _handle_webdav_push(self, draft_settings: AppSettings) -> None:
+        pw_dlg = PassphraseDialog(
+            "WebDAV 端到端加密上传",
+            "请输入端到端加密同步口令（云端服务器仅存储 AES-256-GCM 密文，无法窥探您的账号密码）：",
+            require_confirm=False,
+            parent=self,
+        )
+        if pw_dlg.exec_() != QDialog.Accepted:
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            remote_url = self.storage.push_to_webdav(self.accounts, draft_settings, pw_dlg.passphrase)
+            QApplication.restoreOverrideCursor()
+            self._record_log("INFO", "WEBDAV_PUSH_OK", f"已加密上传 {len(self.accounts)} 个账号至 {remote_url}")
+            QMessageBox.information(self, "云端上传成功", f"已加密同步至：\n{remote_url}")
+        except Exception as err:
+            while QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "WebDAV 上传失败", str(err))
+
+    def _handle_webdav_pull(self, draft_settings: AppSettings) -> None:
+        pw_dlg = PassphraseDialog(
+            "WebDAV 端到端解密拉取合并",
+            "请输入上传时使用的端到端加密同步口令：",
+            require_confirm=False,
+            parent=self,
+        )
+        if pw_dlg.exec_() != QDialog.Accepted:
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            merged, added, updated, kept = self.storage.pull_from_webdav(
+                self.accounts, draft_settings, pw_dlg.passphrase
+            )
+            QApplication.restoreOverrideCursor()
+            self.accounts = merged
+            self._record_log(
+                "INFO",
+                "WEBDAV_PULL_OK",
+                f"从 WebDAV 拉取合并完成：新增={added}，更新={updated}，保留本地={kept}。",
+            )
+            self._rebuild_account_table()
+            self._refresh_roi_tab()
+            self._refresh_kpis(time.time())
+            QMessageBox.information(
+                self,
+                "WebDAV 同步合并完成",
+                f"新增账号：{added} 个\n更新账号：{updated} 个\n保留本地较新记录：{kept} 个",
+            )
+        except Exception as err:
+            while QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "WebDAV 拉取失败", str(err))
+
+    # ------------------------------------------------------------------
+    # Logs, Tray & Settings
+    # ------------------------------------------------------------------
     def _refresh_log_table(self) -> None:
         p = self._palette
         entries = list(reversed(self.storage.logger.read_recent(limit=500)))
@@ -1045,7 +2030,12 @@ class MainWindow(QMainWindow):
         for entry in entries:
             if level_filter != "全部级别" and entry.level != level_filter:
                 continue
-            if kw and kw not in entry.detail.lower() and kw not in entry.account.lower() and kw not in entry.event.lower():
+            if (
+                kw
+                and kw not in entry.detail.lower()
+                and kw not in entry.account.lower()
+                and kw not in entry.event.lower()
+            ):
                 continue
             filtered.append(entry)
 
@@ -1068,18 +2058,6 @@ class MainWindow(QMainWindow):
                     cell_item.setForeground(QColor(p.text_primary))
                 self.log_table.setItem(idx, col_i, cell_item)
 
-    def _on_export_backup(self) -> None:
-        default_name = f"gpt_accounts_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        target, _ = QFileDialog.getSaveFileName(
-            self, "导出账号数据备份", default_name, "JSON Files (*.json)"
-        )
-        if not target:
-            return
-        self._save_accounts_safe()
-        shutil.copy2(self.storage.accounts_file, target)
-        self._record_log("INFO", "BACKUP_EXPORTED", f"已导出数据备份至: {target}")
-        QMessageBox.information(self, "导出成功", f"数据已成功备份至：\n{target}")
-
     def _on_export_logs(self) -> None:
         default_name = f"gpt_manager_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
         target, _ = QFileDialog.getSaveFileName(
@@ -1090,8 +2068,7 @@ class MainWindow(QMainWindow):
         if self.storage.log_file.exists():
             shutil.copy2(self.storage.log_file, target)
         else:
-            with open(target, "w", encoding="utf-8") as f:
-                f.write("")
+            Path(target).write_text("", encoding="utf-8")
         self._record_log("INFO", "LOGS_EXPORTED", f"已导出日志文件至: {target}")
         QMessageBox.information(self, "导出成功", f"日志已导出至：\n{target}")
 
@@ -1113,20 +2090,17 @@ class MainWindow(QMainWindow):
         app_icon = QApplication.windowIcon()
         if not app_icon.isNull():
             self.tray_icon.setIcon(app_icon)
-        self.tray_icon.setToolTip("GPT 账号额度管理助手")
+        self.tray_icon.setToolTip("AI 账号额度与防关联调度控制台")
 
         tray_menu = QMenu(self)
-        show_action = QAction("显示主窗口", self)
-        show_action.triggered.connect(self._restore_from_tray)
-        settings_action = QAction("系统与提醒设置", self)
-        settings_action.triggered.connect(self._on_open_settings)
-        quit_action = QAction("退出程序", self)
-        quit_action.triggered.connect(self._on_force_quit)
-
-        tray_menu.addAction(show_action)
-        tray_menu.addAction(settings_action)
+        tray_menu.addAction("⚡ 智能派发最优账号", self._on_smart_dispatch)
+        tray_menu.addAction("🗔 切换置顶胶囊窗", self._on_toggle_mini_hud)
+        tray_menu.addAction("📷 框选屏幕 OCR 校准", self._on_start_screen_snip_ocr)
         tray_menu.addSeparator()
-        tray_menu.addAction(quit_action)
+        tray_menu.addAction("显示主窗口", self._restore_from_tray)
+        tray_menu.addAction("系统设置与云同步", self._on_open_settings)
+        tray_menu.addSeparator()
+        tray_menu.addAction("退出程序", self._on_force_quit)
 
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self._on_tray_activated)
@@ -1138,35 +2112,34 @@ class MainWindow(QMainWindow):
 
     def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
-            if self.isVisible():
-                if self.isMinimized():
-                    self.showNormal()
-                else:
-                    self.activateWindow()
-            else:
-                self.showNormal()
-                self.activateWindow()
+            self._restore_from_tray()
 
     def _on_force_quit(self) -> None:
         self._is_force_quitting = True
+        self.paste_ctrl.cancel(burn_now=True)
+        self.mini_hud.close()
         if hasattr(self, "tray_icon"):
             self.tray_icon.hide()
         QApplication.quit()
 
     def closeEvent(self, event) -> None:
         if getattr(self, "_is_force_quitting", False):
+            self.paste_ctrl.cancel(burn_now=True)
+            self.mini_hud.close()
             event.accept()
             return
         if getattr(self, "settings", None) and self.settings.minimize_to_tray and self.tray_icon.isVisible():
             event.ignore()
             self.hide()
             self.tray_icon.showMessage(
-                "GPT 账号额度管理助手",
-                "已最小化到系统托盘，后台持续运行倒计时与即将刷新提醒。",
+                "AI 账号调度控制台",
+                "已最小化到系统托盘，后台持续运行倒计时、质保与即将刷新提醒。",
                 QSystemTrayIcon.Information,
                 3000,
             )
         else:
+            self.paste_ctrl.cancel(burn_now=True)
+            self.mini_hud.close()
             event.accept()
 
     def _notify_user(self, title: str, message: str) -> None:
@@ -1175,17 +2148,22 @@ class MainWindow(QMainWindow):
         send_windows_toast(title, message)
 
     def _on_open_settings(self) -> None:
-        dlg = SettingsDialog(self.settings, self, palette=self._palette)
-        if dlg.exec_() == SettingsDialog.Accepted and dlg.saved_settings is not None:
+        dlg = SettingsDialog(
+            self.settings,
+            self,
+            palette=self._palette,
+            on_webdav_push=self._handle_webdav_push,
+            on_webdav_pull=self._handle_webdav_pull,
+        )
+        if dlg.exec_() == QDialog.Accepted and dlg.saved_settings is not None:
             self.settings = dlg.saved_settings
+            self.paste_ctrl.burn_seconds = self.settings.clipboard_burn_seconds
             self.storage.save_settings(self.settings)
 
             task_status = "已开启" if self.settings.background_task_enabled else "已关闭"
-            tray_status = "已启用" if self.settings.minimize_to_tray else "未启用"
             self._record_log(
                 "INFO",
                 "SETTINGS_UPDATED",
-                f"设置已保存：提醒开关={self.settings.notify_enabled}，阈值=额度≥{self.settings.notify_quota_threshold}%/"
-                f"剩余<{self.settings.notify_hours_threshold}h，后台计划任务={task_status}，托盘后台={tray_status}。",
+                f"设置已更新：周额度预警={self.settings.notify_enabled}，质保预警={self.settings.warranty_notify_enabled}，"
+                f"阅后即焚={self.settings.clipboard_burn_seconds}s，后台任务={task_status}。",
             )
-

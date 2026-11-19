@@ -12,8 +12,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.models import Account
+from src.security import (
+    PORTABLE_BACKUP_MAGIC,
+    WebDavSyncClient,
+    decrypt_portable_payload,
+    dpapi_decrypt,
+    dpapi_encrypt,
+    encrypt_portable_payload,
+    merge_account_dicts,
+)
 
-DATA_SCHEMA_VERSION = 1
+DATA_SCHEMA_VERSION = 2
 SCHEDULED_TASK_NAME = "GPTManager_QuotaNotifier"
 
 
@@ -21,30 +30,66 @@ SCHEDULED_TASK_NAME = "GPTManager_QuotaNotifier"
 class AppSettings:
     theme: str = "light"
     notify_enabled: bool = True
-    notify_quota_threshold: int = 20  # 周额度剩余不少于此百分比（如20%）
-    notify_hours_threshold: int = 24  # 离重置时间不足此小时数（如24小时=1天）
-    background_task_enabled: bool = False  # 是否启用 Windows 计划任务后台提醒
-    minimize_to_tray: bool = False  # 关闭窗口时最小化到系统托盘
+    notify_quota_threshold: int = 20
+    notify_hours_threshold: int = 24
+    background_task_enabled: bool = False
+    minimize_to_tray: bool = False
+    warranty_notify_enabled: bool = True
+    warranty_notify_hours: int = 24
+    custom_browser_path: str = ""
+    clipboard_burn_seconds: int = 12
+    webdav_url: str = ""
+    webdav_username: str = ""
+    webdav_password: str = ""
+    _preserved_encrypted_webdav_password: str = field(default="", repr=False, compare=False)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, encrypt_secrets: bool = True) -> Dict[str, Any]:
+        wd_pwd = self.webdav_password
+        if encrypt_secrets:
+            if wd_pwd and sys.platform == "win32":
+                wd_pwd = dpapi_encrypt(wd_pwd)
+            elif not wd_pwd and self._preserved_encrypted_webdav_password:
+                wd_pwd = self._preserved_encrypted_webdav_password
         return {
             "theme": self.theme,
             "notify_enabled": self.notify_enabled,
-            "notify_quota_threshold": self.notify_quota_threshold,
-            "notify_hours_threshold": self.notify_hours_threshold,
+            "notify_quota_threshold": max(1, min(99, int(self.notify_quota_threshold))),
+            "notify_hours_threshold": max(1, min(168, int(self.notify_hours_threshold))),
             "background_task_enabled": self.background_task_enabled,
             "minimize_to_tray": self.minimize_to_tray,
+            "warranty_notify_enabled": self.warranty_notify_enabled,
+            "warranty_notify_hours": max(1, min(168, int(self.warranty_notify_hours))),
+            "custom_browser_path": self.custom_browser_path.strip(),
+            "clipboard_burn_seconds": max(3, min(120, int(self.clipboard_burn_seconds))),
+            "webdav_url": self.webdav_url.strip(),
+            "webdav_username": self.webdav_username.strip(),
+            "webdav_password": wd_pwd,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AppSettings":
+        raw_wd_pwd = str(data.get("webdav_password", "") or "")
+        preserved_raw = ""
+        try:
+            wd_pwd = dpapi_decrypt(raw_wd_pwd) if raw_wd_pwd else ""
+        except Exception:
+            wd_pwd = ""
+            preserved_raw = raw_wd_pwd
         return cls(
             theme=str(data.get("theme", "light")),
             notify_enabled=bool(data.get("notify_enabled", True)),
-            notify_quota_threshold=int(data.get("notify_quota_threshold", 20)),
-            notify_hours_threshold=int(data.get("notify_hours_threshold", 24)),
+            notify_quota_threshold=max(1, min(99, int(data.get("notify_quota_threshold", 20)))),
+            notify_hours_threshold=max(1, min(168, int(data.get("notify_hours_threshold", 24)))),
             background_task_enabled=bool(data.get("background_task_enabled", False)),
             minimize_to_tray=bool(data.get("minimize_to_tray", False)),
+            warranty_notify_enabled=bool(data.get("warranty_notify_enabled", True)),
+            warranty_notify_hours=max(1, min(168, int(data.get("warranty_notify_hours", 24)))),
+            custom_browser_path=str(data.get("custom_browser_path", "")).strip(),
+            clipboard_burn_seconds=max(3, min(120, int(data.get("clipboard_burn_seconds", 12)))),
+            webdav_url=str(data.get("webdav_url", "")).strip(),
+            webdav_username=str(data.get("webdav_username", "")).strip(),
+            webdav_password=wd_pwd,
+            _preserved_encrypted_webdav_password=preserved_raw,
         )
 
 
@@ -93,7 +138,6 @@ def configure_windows_scheduled_task(enable: bool, custom_exe: Optional[Path] = 
         startupinfo.wShowWindow = 0
 
     if enable:
-        # Create or update hourly task
         proc = subprocess.run(
             [
                 "schtasks",
@@ -120,7 +164,6 @@ def configure_windows_scheduled_task(enable: bool, custom_exe: Optional[Path] = 
         err_msg = (proc.stderr or proc.stdout or "未知错误").strip()
         return False, f"创建计划任务失败: {err_msg}"
     else:
-        # Delete task
         proc = subprocess.run(
             ["schtasks", "/delete", "/tn", SCHEDULED_TASK_NAME, "/f"],
             capture_output=True,
@@ -130,19 +173,18 @@ def configure_windows_scheduled_task(enable: bool, custom_exe: Optional[Path] = 
             startupinfo=startupinfo,
             creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
         )
-        if proc.returncode == 0 or "ERROR: The system cannot find the file specified" in (proc.stderr or ""):
+        combined = f"{proc.stderr or ''} {proc.stdout or ''}"
+        if (
+            proc.returncode == 0
+            or "cannot find the file" in combined.lower()
+            or "找不到指定的文件" in combined
+        ):
             return True, "后台计划任务已关闭"
-        err_msg = (proc.stderr or proc.stdout or "未知错误").strip()
+        err_msg = combined.strip() or "未知错误"
         return False, f"删除计划任务失败: {err_msg}"
 
 
-
 def resolve_app_dir() -> Path:
-    """
-    Resolve the directory where persistent `data/` and `logs/` live.
-    When frozen by PyInstaller (`--onefile`), `sys.executable` points to the `.exe` location.
-    When running from source, use the project root directory.
-    """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
@@ -242,6 +284,8 @@ class AccountStorage:
         self.base_dir = base_dir if base_dir is not None else resolve_app_dir()
         self.data_dir = self.base_dir / "data"
         self.logs_dir = self.base_dir / "logs"
+        self.profiles_dir = self.base_dir / "browser_profiles"
+        self.codex_vault_dir = self.data_dir / "codex_vault"
         self.accounts_file = self.data_dir / "accounts.json"
         self.settings_file = self.data_dir / "settings.json"
         self.log_file = self.logs_dir / "events.jsonl"
@@ -249,20 +293,37 @@ class AccountStorage:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.logger = StructuredLogger(self.log_file)
 
-    def load_settings(self) -> AppSettings:
+    def load_settings(self, strict: bool = False) -> AppSettings:
         if not self.settings_file.exists():
             return AppSettings()
         try:
             data = json.loads(self.settings_file.read_text(encoding="utf-8"))
-            return AppSettings.from_dict(data)
-        except Exception:
+            if not isinstance(data, dict):
+                raise ValueError("settings.json 顶层必须是 JSON 对象")
+            settings = AppSettings.from_dict(data)
+            if settings._preserved_encrypted_webdav_password:
+                try:
+                    self.logger.log(
+                        "WARN",
+                        "SETTINGS_WEBDAV_PWD_UNDECRYPTABLE",
+                        "WebDAV 密码 DPAPI 解密失败（可能来自其他机器），已保留原密文未覆盖。",
+                    )
+                except Exception:
+                    pass
+            return settings
+        except Exception as exc:
+            try:
+                self.logger.log("ERROR", "SETTINGS_LOAD_ERROR", f"加载设置文件失败: {exc}")
+            except Exception:
+                pass
+            if strict:
+                raise
             return AppSettings()
 
     def save_settings(self, settings: AppSettings) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.settings_file.write_text(
-            json.dumps(settings.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        serialized = json.dumps(settings.to_dict(encrypt_secrets=True), ensure_ascii=False, indent=2)
+        self._atomic_write_text(self.settings_file, serialized)
 
     def load_theme(self) -> str:
         return self.load_settings().theme
@@ -281,30 +342,171 @@ class AccountStorage:
         if not raw_text:
             return []
         payload = json.loads(raw_text)
-        if not isinstance(payload, dict) or "accounts" not in payload:
+        if not isinstance(payload, dict) or not isinstance(payload.get("accounts"), list):
             raise ValueError(f"数据文件格式非法: {self.accounts_file}")
+
         accounts: List[Account] = []
+        had_legacy_plaintext = False
         for item in payload["accounts"]:
-            accounts.append(Account.from_dict(item))
+            if not isinstance(item, dict):
+                raise ValueError(f"账号记录结构非法: {self.accounts_file}")
+            item_copy = dict(item)
+            raw_pwd = str(item_copy.get("password", ""))
+            raw_tfa = str(item_copy.get("two_fa", ""))
+            if (raw_pwd and not raw_pwd.startswith("dpapi:v1:")) or (
+                raw_tfa and not raw_tfa.startswith("dpapi:v1:")
+            ):
+                had_legacy_plaintext = True
+            item_copy["password"] = dpapi_decrypt(raw_pwd)
+            item_copy["two_fa"] = dpapi_decrypt(raw_tfa)
+            accounts.append(Account.from_dict(item_copy))
+
+        # Transparently upgrade legacy v1 plaintext files to DPAPI-encrypted at rest
+        if had_legacy_plaintext and accounts and sys.platform == "win32":
+            try:
+                self.save_accounts(accounts)
+                self.logger.log("INFO", "STORAGE_DPAPI_UPGRADED", "已自动将旧版明文凭据透明升级为 Windows DPAPI 密文落盘。")
+            except Exception as exc:
+                try:
+                    self.logger.log("ERROR", "STORAGE_DPAPI_UPGRADE_FAILED", f"旧版凭据升级落盘失败: {exc}")
+                except Exception:
+                    pass
         return accounts
 
-    def save_accounts(self, accounts: List[Account]) -> None:
+    def save_accounts(self, accounts: List[Account], encrypt_at_rest: bool = True) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        serialized_accounts: List[Dict[str, Any]] = []
+        for acc in accounts:
+            d = acc.to_dict()
+            if encrypt_at_rest and sys.platform == "win32":
+                d["password"] = dpapi_encrypt(d["password"])
+                d["two_fa"] = dpapi_encrypt(d["two_fa"])
+            serialized_accounts.append(d)
+
         payload = {
             "schema_version": DATA_SCHEMA_VERSION,
+            "encryption": "dpapi:v1" if (encrypt_at_rest and sys.platform == "win32") else "none",
             "updated_at": datetime.now().isoformat(timespec="seconds"),
-            "accounts": [acc.to_dict() for acc in accounts],
+            "accounts": serialized_accounts,
         }
         serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+        self._atomic_write_text(self.accounts_file, serialized)
+
+    def export_portable_backup(
+        self,
+        accounts: List[Account],
+        target_file: Path,
+        passphrase: str,
+    ) -> None:
+        """Export cross-device AES-256-GCM encrypted backup file."""
+        plain_payload = {
+            "schema_version": DATA_SCHEMA_VERSION,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "accounts": [acc.to_dict() for acc in accounts],
+        }
+        encrypted_json = encrypt_portable_payload(plain_payload, passphrase)
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write_text(target_file, encrypted_json)
+
+    def import_backup_merge(
+        self,
+        source_file: Path,
+        existing_accounts: List[Account],
+        passphrase: str = "",
+    ) -> Tuple[List[Account], int, int, int]:
+        """
+        Import either an AES-256-GCM encrypted portable backup OR a legacy JSON backup,
+        performing deterministic LWW merge with `existing_accounts`.
+        Returns (merged_accounts, added_count, updated_count, kept_local_count).
+        """
+        raw_text = Path(source_file).read_text(encoding="utf-8").strip()
+        if not raw_text:
+            raise ValueError("备份文件为空")
+        top = json.loads(raw_text)
+        if not isinstance(top, dict):
+            raise ValueError("备份文件顶层结构非法")
+
+        if top.get("magic") == PORTABLE_BACKUP_MAGIC or ("kdf" in top and "ciphertext" in top):
+            decrypted_payload = decrypt_portable_payload(raw_text, passphrase)
+            remote_raw = decrypted_payload.get("accounts", [])
+            if not isinstance(remote_raw, list) or any(not isinstance(r, dict) for r in remote_raw):
+                raise ValueError("加密备份中的 accounts 结构非法")
+        elif "accounts" in top:
+            raw_list = top["accounts"]
+            if not isinstance(raw_list, list) or any(not isinstance(r, dict) for r in raw_list):
+                raise ValueError("备份文件中的 accounts 结构非法")
+            # Legacy or local DPAPI backup
+            remote_raw = []
+            for item in raw_list:
+                ic = dict(item)
+                ic["password"] = dpapi_decrypt(str(ic.get("password", "")))
+                ic["two_fa"] = dpapi_decrypt(str(ic.get("two_fa", "")))
+                remote_raw.append(ic)
+        else:
+            raise ValueError("无法识别的备份文件结构")
+
+        # Validate each remote record by round-tripping through Account.from_dict
+        validated_remote = [Account.from_dict(r).to_dict() for r in remote_raw]
+        local_dicts = [a.to_dict() for a in existing_accounts]
+
+        merged_dicts, added, updated, kept = merge_account_dicts(local_dicts, validated_remote)
+        merged_accounts = [Account.from_dict(m) for m in merged_dicts]
+        self.save_accounts(merged_accounts)
+        return merged_accounts, added, updated, kept
+
+    def push_to_webdav(
+        self,
+        accounts: List[Account],
+        settings: AppSettings,
+        sync_passphrase: str,
+    ) -> str:
+        client = WebDavSyncClient(
+            base_url=settings.webdav_url,
+            username=settings.webdav_username,
+            password=settings.webdav_password,
+        )
+        payload = {
+            "schema_version": DATA_SCHEMA_VERSION,
+            "synced_at": datetime.now().isoformat(timespec="seconds"),
+            "accounts": [a.to_dict() for a in accounts],
+        }
+        return client.upload_encrypted(payload, sync_passphrase)
+
+    def pull_from_webdav(
+        self,
+        existing_accounts: List[Account],
+        settings: AppSettings,
+        sync_passphrase: str,
+    ) -> Tuple[List[Account], int, int, int]:
+        client = WebDavSyncClient(
+            base_url=settings.webdav_url,
+            username=settings.webdav_username,
+            password=settings.webdav_password,
+        )
+        remote_payload = client.download_decrypted(sync_passphrase)
+        remote_raw = remote_payload.get("accounts", [])
+        if not isinstance(remote_raw, list) or any(not isinstance(r, dict) for r in remote_raw):
+            raise ValueError("云端同步数据中的 accounts 结构非法")
+        validated_remote = [Account.from_dict(r).to_dict() for r in remote_raw]
+        local_dicts = [a.to_dict() for a in existing_accounts]
+
+        merged_dicts, added, updated, kept = merge_account_dicts(local_dicts, validated_remote)
+        merged_accounts = [Account.from_dict(m) for m in merged_dicts]
+        self.save_accounts(merged_accounts)
+        return merged_accounts, added, updated, kept
+
+    @staticmethod
+    def _atomic_write_text(target_path: Path, content: str) -> None:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(
-            prefix="accounts_", suffix=".tmp", dir=str(self.data_dir)
+            prefix=f"{target_path.stem}_", suffix=".tmp", dir=str(target_path.parent)
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
-                tmp_file.write(serialized)
+                tmp_file.write(content)
                 tmp_file.flush()
                 os.fsync(tmp_file.fileno())
-            os.replace(tmp_path, self.accounts_file)
+            os.replace(tmp_path, target_path)
         except Exception:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)

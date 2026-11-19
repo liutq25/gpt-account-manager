@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import traceback
 from pathlib import Path
+from typing import Optional
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon
@@ -21,34 +22,89 @@ def _resolve_resource(rel_path: str) -> Path:
 def run_background_notification_check(storage: Optional[AccountStorage] = None) -> int:
     """
     Called by Windows Task Scheduler in the background (no GUI window).
-    Silently loads data, checks for expiring weekly quotas, sends notifications if needed.
+    Silently loads DPAPI-protected data, checks expiring weekly quotas and expiring warranties,
+    sends native Windows Toast notifications if needed.
     """
     import time
-    from src.models import check_weekly_expiring_accounts, format_duration
+    from src.models import (
+        check_warranty_expiring_accounts,
+        check_weekly_expiring_accounts,
+        format_duration,
+    )
     from src.notifier import send_windows_toast
 
     if storage is None:
         storage = AccountStorage()
-    settings = storage.load_settings()
-    if not settings.notify_enabled:
+    try:
+        settings = storage.load_settings(strict=True)
+    except Exception as exc:
+        try:
+            storage.logger.log("ERROR", "BG_NOTIFY_SETTINGS_ERROR", f"后台提醒加载设置失败: {exc}")
+        except Exception:
+            pass
+        if sys.stderr is not None:
+            try:
+                print(f"[check-notify] failed to load settings: {exc}", file=sys.stderr)
+            except Exception:
+                pass
+        return 1
+
+    if not settings.notify_enabled and not settings.warranty_notify_enabled:
         return 0
 
-    accounts = storage.load_accounts()
+    try:
+        accounts = storage.load_accounts()
+    except Exception as exc:
+        try:
+            storage.logger.log("ERROR", "BG_NOTIFY_LOAD_ERROR", f"后台提醒加载账号数据失败: {exc}")
+        except Exception:
+            pass
+        if sys.stderr is not None:
+            try:
+                print(f"[check-notify] failed to load accounts: {exc}", file=sys.stderr)
+            except Exception:
+                pass
+        return 1
+
     now = time.time()
-    expiring = check_weekly_expiring_accounts(
-        accounts,
-        quota_threshold=settings.notify_quota_threshold,
-        hours_threshold=settings.notify_hours_threshold,
-        now_ts=now,
-    )
-    if expiring:
+    dirty = False
+
+    if settings.notify_enabled:
+        expiring = check_weekly_expiring_accounts(
+            accounts,
+            quota_threshold=settings.notify_quota_threshold,
+            hours_threshold=settings.notify_hours_threshold,
+            now_ts=now,
+        )
         for acc in expiring:
-            acc.weekly_notified_reset_at = acc.weekly_reset_at
             rem_str = format_duration(acc.weekly_remaining_seconds(now) or 0)
-            title = "GPT 账号周额度即将刷新提醒"
+            title = f"{acc.provider} 账号周额度即将刷新提醒"
             msg = f"账号「{acc.name}」周额度还剩 {acc.weekly_quota}%，将在 {rem_str} 后重置，请及时使用！"
-            send_windows_toast(title, msg)
-            storage.logger.log("WARN", "BG_WEEKLY_EXPIRING_NOTIFICATION", msg, f"{acc.name} ({acc.email})")
+            if send_windows_toast(title, msg):
+                acc.weekly_notified_reset_at = acc.weekly_reset_at
+                storage.logger.log("WARN", "BG_WEEKLY_EXPIRING_NOTIFICATION", msg, f"{acc.name} ({acc.email})")
+                dirty = True
+            else:
+                storage.logger.log("ERROR", "BG_TOAST_SEND_FAILED", f"周额度提醒弹窗发送失败: {title}", f"{acc.name} ({acc.email})")
+
+    if settings.warranty_notify_enabled:
+        w_expiring = check_warranty_expiring_accounts(
+            accounts,
+            hours_threshold=settings.warranty_notify_hours,
+            now_ts=now,
+        )
+        for acc in w_expiring:
+            rem_str = format_duration(acc.warranty_remaining_seconds(now) or 0)
+            title = "外购账号质保即将到期验号提醒"
+            msg = f"账号「{acc.name}」({acc.vendor_tag or '外购'}) 质保仅剩 {rem_str}，请尽快验号排查封禁！"
+            if send_windows_toast(title, msg):
+                acc.warranty_notified_at = acc.warranty_expire_at
+                storage.logger.log("WARN", "BG_WARRANTY_EXPIRING_NOTIFICATION", msg, f"{acc.name} ({acc.email})")
+                dirty = True
+            else:
+                storage.logger.log("ERROR", "BG_TOAST_SEND_FAILED", f"质保提醒弹窗发送失败: {title}", f"{acc.name} ({acc.email})")
+
+    if dirty:
         storage.save_accounts(accounts)
     return 0
 

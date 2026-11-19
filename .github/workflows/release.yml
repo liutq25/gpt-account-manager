@@ -1,0 +1,64 @@
+name: Build & Release Windows Executable
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Locked Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Full Unit & Adversarial Edge-Case Test Suite
+        run: |
+          python -m unittest discover -s tests -v
+
+      - name: Build Standalone Windows EXE with PyInstaller
+        run: |
+          python -m PyInstaller --clean --noconfirm "GPT管理助手.spec"
+
+      - name: Generate SHA256 Checksum & Smoke Test Binary
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\GPT管理助手.exe" -ArgumentList "--check-notify" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Smoke test failed with exit code $($p.ExitCode)" }
+          $hash = (Get-FileHash "dist\GPT管理助手.exe" -Algorithm SHA256).Hash
+          "$hash  GPT管理助手.exe" | Out-File -FilePath "dist\SHA256SUMS.txt" -Encoding utf8
+          Get-Content "dist\SHA256SUMS.txt"
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: GPTAccountManager-Windows-x64
+          path: |
+            dist/GPT管理助手.exe
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release (on Tag Push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/GPT管理助手.exe
+            dist/SHA256SUMS.txt
+          generate_release_notes: true

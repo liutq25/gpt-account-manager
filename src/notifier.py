@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import json
+import base64
 import subprocess
 import sys
-from pathlib import Path
-from typing import Optional
+
+
+def _encode_ps_utf8_b64(text: str) -> str:
+    return base64.b64encode((text or "").encode("utf-8")).decode("ascii")
 
 
 def send_windows_toast(title: str, message: str, app_id: str = "GPT账号额度管理助手") -> bool:
@@ -15,19 +17,22 @@ def send_windows_toast(title: str, message: str, app_id: str = "GPT账号额度�
     if sys.platform != "win32":
         return False
 
-    clean_title = title.replace('"', '""').replace("`", "``")
-    clean_msg = message.replace('"', '""').replace("`", "``")
-    clean_app_id = app_id.replace('"', '""')
+    title_b64 = _encode_ps_utf8_b64(title)
+    msg_b64 = _encode_ps_utf8_b64(message)
+    app_id_b64 = _encode_ps_utf8_b64(app_id)
 
     ps_script = f"""
     try {{
+        $titleText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{title_b64}'))
+        $msgText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{msg_b64}'))
+        $appIdText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{app_id_b64}'))
         [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
         $template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
         $textNodes = $template.GetElementsByTagName("text")
-        $textNodes.Item(0).AppendChild($template.CreateTextNode("{clean_title}")) | Out-Null
-        $textNodes.Item(1).AppendChild($template.CreateTextNode("{clean_msg}")) | Out-Null
+        $textNodes.Item(0).AppendChild($template.CreateTextNode($titleText)) | Out-Null
+        $textNodes.Item(1).AppendChild($template.CreateTextNode($msgText)) | Out-Null
         $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
-        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("{clean_app_id}").Show($toast)
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appIdText).Show($toast)
     }} catch {{
         exit 1
     }}
