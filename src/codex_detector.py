@@ -47,6 +47,17 @@ class CodexProfile:
         return self.plan_type.upper() if self.plan_type else "未知订阅"
 
 
+@dataclass
+class CodexRateLimits:
+    five_hour_quota: int
+    five_hour_reset_at: Optional[float]
+    weekly_quota: int
+    weekly_reset_at: Optional[float]
+    event_timestamp: str = ""
+    account_id: str = ""
+    user_id: str = ""
+
+
 def parse_jwt_payload(token: str) -> Dict[str, Any]:
     """Parse payload from unverified JWT token without external crypto dependencies."""
     if not isinstance(token, str) or "." not in token:
@@ -196,13 +207,137 @@ def find_codex_executable() -> Optional[str]:
     return None
 
 
+def _parse_rate_limit_window(window_data: Any, now_ts: float) -> Tuple[int, Optional[float]]:
+    if not isinstance(window_data, dict):
+        return 100, None
+    used_raw = window_data.get("used_percent")
+    resets_raw = window_data.get("resets_at")
+    try:
+        resets_at = float(resets_raw) if resets_raw is not None else None
+    except (TypeError, ValueError):
+        resets_at = None
+
+    if resets_at is not None and resets_at <= now_ts:
+        return 100, None
+
+    try:
+        used_pct = float(used_raw) if used_raw is not None else 0.0
+    except (TypeError, ValueError):
+        used_pct = 0.0
+    remaining = max(0, min(100, int(round(100.0 - used_pct))))
+    return remaining, resets_at
+
+
+def extract_codex_rate_limits(
+    codex_home: Optional[Path] = None,
+    account_id: str = "",
+    user_id: str = "",
+    now_ts: Optional[float] = None,
+    max_files: int = 25,
+) -> Optional[CodexRateLimits]:
+    """
+    Scan recent Codex session JSONL files under `~/.codex/sessions` for the latest
+    `rate_limits` telemetry belonging to the matching account_id / user_id.
+    Converts `used_percent` to remaining quota (0..100) and preserves `resets_at`.
+    """
+    root = codex_home if codex_home is not None else (Path.home() / ".codex")
+    sessions_dir = root / "sessions"
+    if not sessions_dir.exists() or not sessions_dir.is_dir():
+        return None
+
+    try:
+        candidates = sorted(
+            sessions_dir.rglob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:max_files]
+    except OSError:
+        return None
+
+    now = time.time() if now_ts is None else float(now_ts)
+    target_acc = (account_id or "").strip()
+    target_uid = (user_id or "").strip()
+
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        file_acc_id = ""
+        file_uid = ""
+        has_meta = False
+        best_rate_entry: Optional[Tuple[str, Dict[str, Any]]] = None
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+
+            ev_type = obj.get("type")
+            payload = obj.get("payload")
+            if not isinstance(payload, dict):
+                continue
+
+            if ev_type == "session_meta":
+                has_meta = True
+                file_acc_id = str(payload.get("creator_account_id") or "").strip()
+                file_uid = str(payload.get("creator_user_id") or "").strip()
+                # Skip files explicitly belonging to a different account
+                if target_acc and file_acc_id and file_acc_id != target_acc:
+                    best_rate_entry = None
+                    break
+                if target_uid and file_uid and file_uid != target_uid:
+                    best_rate_entry = None
+                    break
+
+            elif ev_type == "event_msg" and payload.get("type") == "token_count":
+                rl = payload.get("rate_limits")
+                if isinstance(rl, dict) and (rl.get("primary") or rl.get("secondary")):
+                    limit_id = str(rl.get("limit_id") or "").strip().lower()
+                    ev_ts = str(obj.get("timestamp") or "").strip()
+                    # Prefer primary 'codex' limit_id if multiple models emit limits
+                    if best_rate_entry is None or limit_id in ("", "codex") or best_rate_entry[1].get("limit_id") not in (None, "", "codex"):
+                        best_rate_entry = (ev_ts, rl)
+
+        if best_rate_entry is None:
+            continue
+        if (target_acc or target_uid) and has_meta:
+            if target_acc and file_acc_id and file_acc_id != target_acc:
+                continue
+            if target_uid and file_uid and file_uid != target_uid:
+                continue
+
+        ev_ts, rl = best_rate_entry
+        q5, r5 = _parse_rate_limit_window(rl.get("primary"), now)
+        qw, rw = _parse_rate_limit_window(rl.get("secondary"), now)
+        return CodexRateLimits(
+            five_hour_quota=q5,
+            five_hour_reset_at=r5,
+            weekly_quota=qw,
+            weekly_reset_at=rw,
+            event_timestamp=ev_ts,
+            account_id=file_acc_id or target_acc,
+            user_id=file_uid or target_uid,
+        )
+
+    return None
+
+
 class CodexMonitor(QObject):
     """
-    Watches `~/.codex/auth.json` in real time using QFileSystemWatcher and polling fallback.
-    Emits `profile_updated(Optional[CodexProfile])` whenever auth state changes.
+    Watches `~/.codex/auth.json` and `~/.codex/sessions` in real time using QFileSystemWatcher
+    and polling fallback. Emits `profile_updated` and `rate_limits_updated`.
     """
 
     profile_updated = pyqtSignal(object)  # Optional[CodexProfile]
+    rate_limits_updated = pyqtSignal(object)  # Optional[CodexRateLimits]
 
     def __init__(
         self,
@@ -215,6 +350,8 @@ class CodexMonitor(QObject):
         self.auth_file = self.codex_dir / "auth.json"
         self._last_profile: Optional[CodexProfile] = None
         self._last_mtime: float = -1.0
+        self._last_rate_limits: Optional[CodexRateLimits] = None
+        self._last_session_sig: Optional[Tuple[str, float]] = None
 
         # File system watcher
         self._watcher = QFileSystemWatcher(self)
@@ -245,13 +382,49 @@ class CodexMonitor(QObject):
         self._ensure_watched()
         self.check_now()
 
+    def _latest_session_signature(self) -> Optional[Tuple[str, float]]:
+        sessions_dir = self.codex_dir / "sessions"
+        if not sessions_dir.exists():
+            return None
+        try:
+            newest_path = ""
+            newest_mtime = -1.0
+            for p in sessions_dir.rglob("*.jsonl"):
+                mt = p.stat().st_mtime
+                if mt > newest_mtime:
+                    newest_mtime = mt
+                    newest_path = str(p)
+            return (newest_path, newest_mtime) if newest_path else None
+        except OSError:
+            return None
+
+    def check_rate_limits(self, force: bool = False) -> Optional[CodexRateLimits]:
+        prof = self._last_profile
+        if prof is None:
+            return None
+        sig = self._latest_session_signature()
+        if not force and sig == self._last_session_sig and self._last_rate_limits is not None:
+            return self._last_rate_limits
+        self._last_session_sig = sig
+        rl = extract_codex_rate_limits(
+            codex_home=self.codex_dir,
+            account_id=prof.account_id,
+            user_id=prof.user_id,
+        )
+        if rl != self._last_rate_limits:
+            self._last_rate_limits = rl
+            self.rate_limits_updated.emit(rl)
+        return rl
+
     def check_now(self) -> Optional[CodexProfile]:
-        """Check auth.json mtime and extract profile if changed."""
+        """Check auth.json mtime and extract profile if changed, plus session rate limits."""
         self._ensure_watched()
         if not self.auth_file.exists():
             if self._last_profile is not None or self._last_mtime != -1.0:
                 self._last_mtime = -1.0
                 self._last_profile = None
+                self._last_rate_limits = None
+                self._last_session_sig = None
                 self.profile_updated.emit(None)
             return None
 
@@ -260,14 +433,19 @@ class CodexMonitor(QObject):
         except OSError:
             return self._last_profile
 
-        if mtime == self._last_mtime:
-            return self._last_profile
+        profile_changed = mtime != self._last_mtime
+        if profile_changed:
+            self._last_mtime = mtime
+            new_prof = extract_codex_profile(self.auth_file)
+            self._last_profile = new_prof
+            self._last_rate_limits = None
+            self._last_session_sig = None
+            self.profile_updated.emit(new_prof)
 
-        self._last_mtime = mtime
-        new_prof = extract_codex_profile(self.auth_file)
-        self._last_profile = new_prof
-        self.profile_updated.emit(new_prof)
-        return new_prof
+        if self._last_profile is not None:
+            self.check_rate_limits(force=profile_changed)
+
+        return self._last_profile
 
     @property
     def current_profile(self) -> Optional[CodexProfile]:

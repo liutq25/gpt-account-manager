@@ -51,7 +51,9 @@ from src.dialogs import (
 from src.codex_detector import (
     CodexMonitor,
     CodexProfile,
+    CodexRateLimits,
     extract_codex_profile,
+    extract_codex_rate_limits,
 )
 from src.launcher import (
     SequentialPasteController,
@@ -95,7 +97,12 @@ class RowWidgets:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, storage: AccountStorage, initial_theme: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        storage: AccountStorage,
+        initial_theme: Optional[str] = None,
+        codex_home: Optional[Path] = None,
+    ) -> None:
         super().__init__()
         self.storage = storage
         self.settings: AppSettings = self.storage.load_settings()
@@ -108,10 +115,12 @@ class MainWindow(QMainWindow):
         self._focused_account_id: Optional[str] = None
         self._snip_overlay: Optional[ScreenSnipOverlay] = None
 
-        self.codex_mgr = CodexAuthManager(self.storage.codex_vault_dir)
+        self.codex_mgr = CodexAuthManager(self.storage.codex_vault_dir, codex_home=codex_home)
         self.codex_monitor = CodexMonitor(codex_home=self.codex_mgr.codex_dir, parent=self)
         self.codex_monitor.profile_updated.connect(self._on_codex_profile_changed)
+        self.codex_monitor.rate_limits_updated.connect(self._on_codex_rate_limits_changed)
         self._dismissed_codex_emails: Set[str] = set()
+        self._deleted_codex_emails_this_session: Set[str] = set()
         self._pending_codex_profile: Optional[CodexProfile] = None
 
         self.paste_ctrl = SequentialPasteController(
@@ -136,7 +145,10 @@ class MainWindow(QMainWindow):
         self._init_system_tray()
         self._apply_theme(self.current_theme, persist=False, log_event=False)
         self._load_initial_data()
-        self.codex_monitor.check_now()
+        self._startup_codex_timer = QTimer(self)
+        self._startup_codex_timer.setSingleShot(True)
+        self._startup_codex_timer.timeout.connect(self.codex_monitor.check_now)
+        self._startup_codex_timer.start(0)
 
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(1000)
@@ -1286,10 +1298,10 @@ class MainWindow(QMainWindow):
             if hasattr(self, "codex_banner"):
                 self.codex_banner.setVisible(False)
             self._pending_codex_profile = None
-            if not self.codex_mgr.has_snapshot(matched.id):
+            # Always keep the latest DPAPI-encrypted auth.json snapshot preserved for this account
+            if self.codex_mgr.auth_file.exists():
                 try:
                     self.codex_mgr.capture_current_auth(matched.id)
-                    self._record_log("INFO", "CODEX_AUTO_SNAPSHOT", f"自动同步已纳管账号「{matched.name}」的 Codex 快照。")
                 except Exception:
                     pass
             if matched.warranty_expire_at is None and profile.subscription_expire_timestamp is not None:
@@ -1299,18 +1311,67 @@ class MainWindow(QMainWindow):
                 self._rebuild_account_table()
         else:
             self._pending_codex_profile = profile
-            if email.lower() not in self._dismissed_codex_emails and hasattr(self, "codex_banner"):
+            if email.lower() not in self._deleted_codex_emails_this_session:
+                # Auto-ingest immediately so every logged-in Codex account is preserved without manual action
+                self._auto_ingest_codex_profile(profile, silent=True)
+            elif email.lower() not in self._dismissed_codex_emails and hasattr(self, "codex_banner"):
                 self.codex_banner_lbl.setText(
-                    f"🔍 检测到宿主机 Codex 已登录新账号：{email} ({plan_desc})，尚未纳入本系统管理。"
+                    f"🔍 检测到宿主机 Codex 已登录账号：{email} ({plan_desc})，尚未纳入本系统管理。"
                 )
                 self.codex_banner.setVisible(True)
+
+    def _on_codex_rate_limits_changed(self, rl: Optional[CodexRateLimits]) -> None:
+        if rl is None:
+            return
+        prof = self.codex_monitor.current_profile
+        if prof is None:
+            return
+        matched: Optional[Account] = None
+        for acc in self.accounts:
+            if acc.email.strip().lower() == prof.email.strip().lower():
+                matched = acc
+                break
+        if matched is None:
+            return
+
+        changed = (
+            matched.five_hour_quota != rl.five_hour_quota
+            or matched.weekly_quota != rl.weekly_quota
+            or abs((matched.five_hour_reset_at or 0.0) - (rl.five_hour_reset_at or 0.0)) > 2.0
+            or (matched.five_hour_reset_at is None) != (rl.five_hour_reset_at is None)
+            or abs((matched.weekly_reset_at or 0.0) - (rl.weekly_reset_at or 0.0)) > 2.0
+            or (matched.weekly_reset_at is None) != (rl.weekly_reset_at is None)
+        )
+        if not changed:
+            return
+
+        matched.five_hour_quota = rl.five_hour_quota
+        matched.five_hour_reset_at = rl.five_hour_reset_at
+        matched.weekly_quota = rl.weekly_quota
+        matched.weekly_reset_at = rl.weekly_reset_at
+        matched.updated_at = time.time()
+
+        self._save_accounts_safe()
+        self._rebuild_account_table()
+        self._refresh_kpis()
+        self._record_log(
+            "INFO",
+            "CODEX_QUOTA_SYNCED",
+            f"已同步 Codex 实时额度：5h 剩余 {rl.five_hour_quota}%，周剩余 {rl.weekly_quota}%。",
+            matched.name,
+        )
+        if hasattr(self, "status_bar"):
+            self.status_bar.showMessage(
+                f"🔄 已同步「{matched.name}」Codex 实时额度：5h 剩余 {rl.five_hour_quota}% | 周剩余 {rl.weekly_quota}%",
+                6000,
+            )
 
     def _on_ingest_current_codex(self) -> None:
         prof = self._pending_codex_profile or self.codex_monitor.current_profile
         if prof is None:
             QMessageBox.information(self, "未检测到账号", "当前宿主机未检测到有效登录的 Codex 账号。")
             return
-        self._auto_ingest_codex_profile(prof)
+        self._auto_ingest_codex_profile(prof, silent=False)
 
     def _on_dismiss_codex_banner(self) -> None:
         if self._pending_codex_profile:
@@ -1321,22 +1382,25 @@ class MainWindow(QMainWindow):
     def _on_codex_login_ingest(self) -> None:
         dlg = CodexLoginDialog(monitor=self.codex_monitor, parent=self, palette=self._palette)
         if dlg.exec_() == QDialog.Accepted and dlg.captured_profile:
-            self._auto_ingest_codex_profile(dlg.captured_profile)
+            self._deleted_codex_emails_this_session.discard(dlg.captured_profile.email.strip().lower())
+            self._auto_ingest_codex_profile(dlg.captured_profile, silent=False)
 
-    def _auto_ingest_codex_profile(self, profile: CodexProfile) -> None:
+    def _auto_ingest_codex_profile(self, profile: CodexProfile, silent: bool = False) -> None:
+        self._deleted_codex_emails_this_session.discard(profile.email.strip().lower())
         for acc in self.accounts:
             if acc.email.strip().lower() == profile.email.strip().lower():
-                QMessageBox.information(
-                    self,
-                    "账号已存在",
-                    f"账号「{profile.email}」已在管理列表中，名称为「{acc.name}」，已为您自动同步最新授权快照。",
-                )
                 try:
                     self.codex_mgr.capture_current_auth(acc.id)
                 except Exception:
                     pass
                 if hasattr(self, "codex_banner"):
                     self.codex_banner.setVisible(False)
+                if not silent:
+                    QMessageBox.information(
+                        self,
+                        "账号已存在",
+                        f"账号「{profile.email}」已在管理列表中，名称为「{acc.name}」，已为您自动同步最新授权快照。",
+                    )
                 return
 
         new_id = uuid.uuid4().hex[:12]
@@ -1357,6 +1421,18 @@ class MainWindow(QMainWindow):
             updated_at=time.time(),
         )
 
+        # Also sync initial Codex rate limits if available for this account
+        rl = extract_codex_rate_limits(
+            codex_home=self.codex_mgr.codex_dir,
+            account_id=profile.account_id,
+            user_id=profile.user_id,
+        )
+        if rl is not None:
+            new_acc.five_hour_quota = rl.five_hour_quota
+            new_acc.five_hour_reset_at = rl.five_hour_reset_at
+            new_acc.weekly_quota = rl.weekly_quota
+            new_acc.weekly_reset_at = rl.weekly_reset_at
+
         try:
             self.codex_mgr.capture_current_auth(new_acc.id)
         except Exception as err:
@@ -1374,24 +1450,26 @@ class MainWindow(QMainWindow):
         self._record_log(
             "INFO",
             "CODEX_AUTO_INGESTED",
-            f"已自动纳管系统 Codex 账号「{acc_name}」({profile.email})，免密捕获成功。",
+            f"已自动保留并纳管系统 Codex 账号「{acc_name}」({profile.email})。",
             f"{acc_name}",
         )
 
         send_windows_toast(
-            "Codex 账号自动录入成功",
-            f"已自动获取并纳管：{profile.email} ({profile.display_plan})\n凭据已加密保存，无需手动输入！",
+            "Codex 账号已自动保留纳管",
+            f"已自动获取并保留：{profile.email} ({profile.display_plan})\n凭据快照与实时额度已同步！",
         )
-        QMessageBox.information(
-            self,
-            "自动录入成功",
-            f"已成功捕获并纳管 Codex 账号：\n\n"
-            f"• 账号名称: {new_acc.name}\n"
-            f"• 登录邮箱: {new_acc.email}\n"
-            f"• 订阅计划: {profile.display_plan}\n"
-            f"• 授权凭据: 已通过 DPAPI 系统级密文快照归档\n\n"
-            f"您现在可以在账号列表中随时一键切换使用此账号！",
-        )
+        if not silent:
+            QMessageBox.information(
+                self,
+                "自动录入成功",
+                f"已成功捕获并纳管 Codex 账号：\n\n"
+                f"• 账号名称: {new_acc.name}\n"
+                f"• 登录邮箱: {new_acc.email}\n"
+                f"• 订阅计划: {profile.display_plan}\n"
+                f"• 5h / 周额度: {new_acc.five_hour_quota}% / {new_acc.weekly_quota}%\n"
+                f"• 授权凭据: 已通过 DPAPI 系统级密文快照归档\n\n"
+                f"您现在可以在账号列表中随时一键切换使用此账号！",
+            )
 
     def _on_start_screen_snip_ocr(self) -> None:
         if not self.accounts:
@@ -1864,6 +1942,7 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
+        self._deleted_codex_emails_this_session.add(acc.email.strip().lower())
         self.accounts = [a for a in self.accounts if a.id != account_id]
         self._revealed_pwds.discard(account_id)
         if self.paste_ctrl.active_account and self.paste_ctrl.active_account.id == account_id:
