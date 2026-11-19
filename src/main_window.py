@@ -75,6 +75,7 @@ from src.models import (
     select_optimal_account,
 )
 from src.notifier import send_windows_toast
+from src.network_widget import NetworkLabTab
 from src.ocr_sync import CodexAuthManager, parse_quota_from_ocr_text, run_windows_ocr
 from src.security import SecurityError
 from src.storage import AccountStorage, AppSettings, LogEntry
@@ -245,9 +246,16 @@ class MainWindow(QMainWindow):
         self.accounts_tab = self._build_accounts_tab()
         self.roi_tab = self._build_roi_tab()
         self.logs_tab = self._build_logs_tab()
+        self.network_tab = NetworkLabTab(
+            config_path=self.storage.data_dir / "network_config.json",
+            get_accounts_fn=lambda: self.accounts,
+            palette=self._palette,
+            parent=self,
+        )
         self.tabs.addTab(self.accounts_tab, "账号调度与额度管理")
         self.tabs.addTab(self.roi_tab, "资产质保与渠道 ROI 统计")
         self.tabs.addTab(self.logs_tab, "结构化审计日志")
+        self.tabs.addTab(self.network_tab, "🌐 节点测速与 IP 风控")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         body_layout.addWidget(self.tabs)
 
@@ -299,6 +307,8 @@ class MainWindow(QMainWindow):
         self._style_kpi_cards()
         self._style_paste_banner()
         self.mini_hud.apply_palette(self._palette)
+        if hasattr(self, "network_tab"):
+            self.network_tab.apply_palette(self._palette)
 
         if persist:
             try:
@@ -906,6 +916,11 @@ class MainWindow(QMainWindow):
                 "💾 捕获当前 ~/.codex/auth.json 绑定到此号",
                 lambda aid=acc.id: self._on_capture_codex_auth(aid),
             )
+            l_menu.addSeparator()
+            l_menu.addAction(
+                "📡 测速并评估节点 IP / VPN 风险",
+                lambda aid=acc.id: self._on_probe_account_network(aid),
+            )
             launch_btn.setMenu(l_menu)
 
             quota_btn = QPushButton("改额度")
@@ -1266,6 +1281,20 @@ class MainWindow(QMainWindow):
             )
         except Exception as err:
             QMessageBox.warning(self, "切换 Codex 授权失败", str(err))
+
+    def _on_probe_account_network(self, account_id: str) -> None:
+        acc = self._find_account(account_id)
+        if acc is None:
+            return
+        if hasattr(self, "network_tab"):
+            self.tabs.setCurrentWidget(self.network_tab)
+            self.network_tab.probe_account_proxy(acc)
+            self._record_log(
+                "INFO",
+                "NETWORK_IP_PROBE",
+                f"已为账号「{acc.name}」触发节点测速与 VPN/IP 风险评分。",
+                acc.name,
+            )
 
     def _on_codex_profile_changed(self, profile: Optional[CodexProfile]) -> None:
         if profile is None:
@@ -2196,6 +2225,8 @@ class MainWindow(QMainWindow):
     def _on_force_quit(self) -> None:
         self._is_force_quitting = True
         self.paste_ctrl.cancel(burn_now=True)
+        if hasattr(self, "network_tab"):
+            self.network_tab.shutdown()
         self.mini_hud.close()
         if hasattr(self, "tray_icon"):
             self.tray_icon.hide()
@@ -2204,6 +2235,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         if getattr(self, "_is_force_quitting", False):
             self.paste_ctrl.cancel(burn_now=True)
+            if hasattr(self, "network_tab"):
+                self.network_tab.shutdown()
             self.mini_hud.close()
             event.accept()
             return
@@ -2218,6 +2251,8 @@ class MainWindow(QMainWindow):
             )
         else:
             self.paste_ctrl.cancel(burn_now=True)
+            if hasattr(self, "network_tab"):
+                self.network_tab.shutdown()
             self.mini_hud.close()
             event.accept()
 
