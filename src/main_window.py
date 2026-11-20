@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (
     QDialog,
     QFileDialog,
     QFrame,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -182,7 +183,7 @@ class MainWindow(QMainWindow):
         title_lbl = QLabel("AI 账号双窗额度与防关联调度控制台")
         title_lbl.setObjectName("AppTitle")
         sub_lbl = QLabel(
-            "DPAPI 系统级密文仓 · EEQF 防作废派号 · Chromium 独立代理隔离 · 离线 WinRT OCR 校准 · 质保 ROI 账本"
+            "DPAPI 密文仓 · EEQF 智能派号 · 独立代理隔离 · 节点 IP 风控 · 离线 OCR"
         )
         sub_lbl.setObjectName("AppSubtitle")
         title_col.addWidget(title_lbl)
@@ -211,11 +212,13 @@ class MainWindow(QMainWindow):
 
         self.codex_status_badge = QLabel("Codex: 检测中...")
         self.codex_status_badge.setStyleSheet(
-            "color: #94A3B8; font-size: 11px; padding: 3px 8px; border-radius: 4px; border: 1px solid #334155;"
+            "color: #94A3B8; font-size: 11px; padding: 4px 10px; border-radius: 10px; border: 1px solid #334155;"
         )
         header_layout.addWidget(self.codex_status_badge)
 
         self.clock_label = QLabel("")
+        self.clock_label.setMinimumWidth(148)
+        self.clock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.clock_label.setStyleSheet(
             "color: #CBD5E1; font-family: 'Consolas', monospace; font-size: 13px;"
         )
@@ -252,9 +255,9 @@ class MainWindow(QMainWindow):
             palette=self._palette,
             parent=self,
         )
-        self.tabs.addTab(self.accounts_tab, "账号调度与额度管理")
-        self.tabs.addTab(self.roi_tab, "资产质保与渠道 ROI 统计")
-        self.tabs.addTab(self.logs_tab, "结构化审计日志")
+        self.tabs.addTab(self.accounts_tab, "📊 账号调度与额度管理")
+        self.tabs.addTab(self.roi_tab, "💰 资产质保与渠道 ROI")
+        self.tabs.addTab(self.logs_tab, "📜 结构化审计日志")
         self.tabs.addTab(self.network_tab, "🌐 节点测速与 IP 风控")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         body_layout.addWidget(self.tabs)
@@ -269,8 +272,14 @@ class MainWindow(QMainWindow):
     def _create_kpi_card(self, title: str, initial_value: str) -> tuple[QFrame, QLabel, QLabel]:
         card = QFrame()
         card.setObjectName("KpiCard")
+        shadow = QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(16)
+        shadow.setOffset(0, 3)
+        shadow.setColor(QColor(15, 23, 42, 22))
+        card.setGraphicsEffect(shadow)
+
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(4)
 
         t_lbl = QLabel(title)
@@ -281,6 +290,7 @@ class MainWindow(QMainWindow):
 
     def _style_kpi_cards(self) -> None:
         p = self._palette
+        is_dark = p.name == "dark"
         specs = [
             (self.kpi_total, p.kpi_total_accent),
             (self.kpi_5h_ready, p.kpi_5h_ready_accent),
@@ -290,10 +300,16 @@ class MainWindow(QMainWindow):
         for (card, t_lbl, v_lbl), accent in specs:
             card.setStyleSheet(
                 f"QFrame#KpiCard {{ background-color: {p.surface_bg}; border: 1px solid {p.border}; "
-                f"border-left: 4px solid {accent}; border-radius: 8px; }}"
+                f"border-left: 4px solid {accent}; border-radius: 12px; }}"
+                f"QFrame#KpiCard:hover {{ border-color: {accent}; }}"
             )
+            eff = card.graphicsEffect()
+            if isinstance(eff, QGraphicsDropShadowEffect):
+                eff.setColor(QColor(0, 0, 0, 85) if is_dark else QColor(15, 23, 42, 22))
             t_lbl.setStyleSheet(f"color: {p.text_muted}; font-size: 12px; font-weight: 600;")
-            v_lbl.setStyleSheet(f"color: {accent}; font-size: 22px; font-weight: 700;")
+            v_lbl.setStyleSheet(
+                f"color: {accent}; font-size: 25px; font-weight: 800; font-family: 'Segoe UI', 'Microsoft YaHei UI';"
+            )
 
     def _apply_theme(self, theme_name: str, persist: bool = True, log_event: bool = True) -> None:
         self.current_theme = "dark" if theme_name == "dark" else "light"
@@ -354,20 +370,25 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        # Toolbar
+        # Toolbar (2-tier layout to prevent horizontal clipping on any DPI/resolution)
         toolbar = QFrame()
         toolbar.setObjectName("ToolbarFrame")
-        tb_layout = QHBoxLayout(toolbar)
-        tb_layout.setContentsMargins(12, 10, 12, 10)
-        tb_layout.setSpacing(8)
+        tb_outer = QVBoxLayout(toolbar)
+        tb_outer.setContentsMargins(12, 10, 12, 10)
+        tb_outer.setSpacing(8)
+
+        tb_row1 = QHBoxLayout()
+        tb_row1.setSpacing(8)
 
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("搜索名称、邮箱或渠道...")
-        self.search_input.setMaximumWidth(210)
+        self.search_input.setPlaceholderText("🔍 搜索名称、邮箱或渠道...")
+        self.search_input.setMinimumWidth(220)
+        self.search_input.setMaximumWidth(300)
         self.search_input.textChanged.connect(self._rebuild_account_table)
 
         self.provider_filter_combo = QComboBox()
         self.provider_filter_combo.addItems(["全部平台", *VALID_PROVIDERS])
+        self.provider_filter_combo.setMinimumWidth(110)
         self.provider_filter_combo.currentIndexChanged.connect(self._rebuild_account_table)
 
         self.filter_combo = QComboBox()
@@ -380,21 +401,42 @@ class MainWindow(QMainWindow):
                 "异常/封禁/质保临期",
             ]
         )
+        self.filter_combo.setMinimumWidth(155)
         self.filter_combo.currentIndexChanged.connect(self._rebuild_account_table)
 
-        tb_layout.addWidget(self.search_input)
-        tb_layout.addWidget(self.provider_filter_combo)
-        tb_layout.addWidget(self.filter_combo)
-        tb_layout.addStretch()
+        tb_row1.addWidget(self.search_input)
+        tb_row1.addWidget(self.provider_filter_combo)
+        tb_row1.addWidget(self.filter_combo)
+        tb_row1.addStretch()
 
-        # Smart Dispatch Button (EEQF)
+        # Primary Action Buttons
         dispatch_btn = QPushButton("⚡ 智能派号 (EEQF)")
         dispatch_btn.setObjectName("PrimaryButton")
         dispatch_btn.setToolTip(
             "按「最早过期周额度优先」算法一键选出最紧急可用账号，自动启动 5h 倒计时并装载上号队列 (Ctrl+Shift+D)"
         )
         dispatch_btn.clicked.connect(self._on_smart_dispatch)
-        tb_layout.addWidget(dispatch_btn)
+        tb_row1.addWidget(dispatch_btn)
+
+        codex_login_btn = QPushButton("🌐 官方登录新号")
+        codex_login_btn.setObjectName("PrimaryButton")
+        codex_login_btn.setToolTip("通过官方 OAuth 登录网页，完成后免密全自动提取账号凭据与会员状态")
+        codex_login_btn.clicked.connect(self._on_codex_login_ingest)
+        tb_row1.addWidget(codex_login_btn)
+
+        add_btn = QPushButton("+ 添加账号")
+        add_btn.setObjectName("PrimaryButton")
+        add_btn.clicked.connect(self._on_add_account)
+        tb_row1.addWidget(add_btn)
+
+        tb_outer.addLayout(tb_row1)
+
+        tb_row2 = QHBoxLayout()
+        tb_row2.setSpacing(8)
+
+        batch_btn = QPushButton("📋 批量识别导入")
+        batch_btn.clicked.connect(self._on_batch_import)
+        tb_row2.addWidget(batch_btn)
 
         # Offline OCR Menu Button
         ocr_btn = QPushButton("📷 离线OCR校准")
@@ -403,7 +445,7 @@ class MainWindow(QMainWindow):
         ocr_menu.addAction("从系统剪贴板截图识别 (Win+Shift+S)", self._on_clipboard_ocr)
         ocr_menu.addAction("选择本地截图文件识别...", self._on_file_ocr)
         ocr_btn.setMenu(ocr_menu)
-        tb_layout.addWidget(ocr_btn)
+        tb_row2.addWidget(ocr_btn)
 
         # Backup & Sync Menu Button
         backup_btn = QPushButton("🔐 加密备份/恢复")
@@ -413,23 +455,10 @@ class MainWindow(QMainWindow):
         backup_menu.addSeparator()
         backup_menu.addAction("导出本地原文件备份...", self._on_export_backup)
         backup_btn.setMenu(backup_menu)
-        tb_layout.addWidget(backup_btn)
+        tb_row2.addWidget(backup_btn)
+        tb_row2.addStretch()
 
-        batch_btn = QPushButton("批量识别导入")
-        batch_btn.clicked.connect(self._on_batch_import)
-        tb_layout.addWidget(batch_btn)
-
-        add_btn = QPushButton("+ 添加账号")
-        add_btn.setObjectName("PrimaryButton")
-        add_btn.clicked.connect(self._on_add_account)
-        tb_layout.addWidget(add_btn)
-
-        codex_login_btn = QPushButton("⚡ 官方登录新号")
-        codex_login_btn.setObjectName("PrimaryButton")
-        codex_login_btn.setToolTip("通过官方 OAuth 登录网页，完成后免密全自动提取账号凭据与会员状态")
-        codex_login_btn.clicked.connect(self._on_codex_login_ingest)
-        tb_layout.addWidget(codex_login_btn)
-
+        tb_outer.addLayout(tb_row2)
         layout.addWidget(toolbar)
 
         # Codex Auto-Detection Banner (shows when unmanaged Codex account detected)
@@ -516,13 +545,14 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(7, QHeaderView.Fixed)
         header.setSectionResizeMode(8, QHeaderView.Fixed)
 
-        self.account_table.setColumnWidth(0, 175)
-        self.account_table.setColumnWidth(2, 165)
-        self.account_table.setColumnWidth(3, 155)
-        self.account_table.setColumnWidth(4, 215)
-        self.account_table.setColumnWidth(5, 112)
-        self.account_table.setColumnWidth(6, 130)
-        self.account_table.setColumnWidth(7, 128)
+        self.account_table.setColumnWidth(0, 155)
+        self.account_table.setColumnWidth(1, 185)
+        self.account_table.setColumnWidth(2, 140)
+        self.account_table.setColumnWidth(3, 140)
+        self.account_table.setColumnWidth(4, 200)
+        self.account_table.setColumnWidth(5, 102)
+        self.account_table.setColumnWidth(6, 115)
+        self.account_table.setColumnWidth(7, 122)
         self.account_table.setColumnWidth(8, 224)
 
         layout.addWidget(self.account_table, 1)

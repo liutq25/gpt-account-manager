@@ -294,12 +294,21 @@ class NetworkLabTab(QWidget):
         self.table.doubleClicked.connect(self.start_selected_test)
 
         hdr = self.table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(0, QHeaderView.Interactive)
+        hdr.setSectionResizeMode(1, QHeaderView.Interactive)
         hdr.setSectionResizeMode(2, QHeaderView.Stretch)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.Interactive)
         for col in range(4, 11):
-            hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+            hdr.setSectionResizeMode(col, QHeaderView.Interactive)
+
+        self.table.setColumnWidth(0, 170)
+        self.table.setColumnWidth(1, 120)
+        self.table.setColumnWidth(3, 155)
+        for col in (4, 5, 6, 7):
+            self.table.setColumnWidth(col, 72)
+        self.table.setColumnWidth(8, 65)
+        self.table.setColumnWidth(9, 105)
+        self.table.setColumnWidth(10, 82)
 
         root.addWidget(self.table, 1)
 

@@ -1,40 +1,100 @@
-# AI 多平台账号双窗额度与防关联调度控制台 (v2.0)
+<div align="center">
 
-基于 PyQt5 构建的 Windows 桌面工具，统一纳管 **ChatGPT / Claude / Codex / Custom** 多账号凭据、5h 滚动窗口与周限额倒计时、防关联独立浏览器隔离启动、离线原生 OCR 额度回填、外购质保防损账本与端到端加密云同步。
+# ⚡ AI 多平台账号双窗额度与防关联调度控制台 (v2.0)
 
-## 功能特性
+**一站式纳管 ChatGPT / Claude / Codex / Custom 账号凭据 · 5h/周双时间窗防作废调度 · 系统 Codex 免密自动捕获与实时额度同步 · 节点测速与 VPN/IP 风控评分 · 离线 OCR 校准**
 
-- **系统级密文存储与端到端云同步 (`M1`)**：
-  - 本地 `data/accounts.json` 与 `data/settings.json` 中的登录密码、2FA 种子密钥及 WebDAV 密码全部经由 **Windows DPAPI (`CryptProtectData`)** 绑定当前系统账户透明加密落盘；自动兼容旧版 v1 明文文件并静默升级。
-  - 支持导出/导入跨设备 **PBKDF2-HMAC-SHA256 (600,000 轮) + AES-256-GCM** 加密备份包，支持坚果云 / Nextcloud 等 **WebDAV 端到端加密同步** 与基于 `updated_at` 的 Last-Write-Wins (LWW) 多端合并。
-- **系统 Codex 登录监测与免密一键自动录入纳管 (`M7 - 零手动录入`)**：
-  - 软件启动与运行过程中通过 `QFileSystemWatcher` 毫秒级监测宿主机 `~/.codex/auth.json` 授权变化。
-  - 自动无损解析 JWT Claims，秒级提取账号邮箱、用户名昵称、会员等级（Plus / Team / Pro / Free）及官方订阅到期时间戳。
-  - **开机自动感知**：发现未纳管 Codex 账号时自动置顶高亮横幅，支持「一键自动纳管」，自动加密归档快照，无需手动填写任何邮箱或密码。
-  - **官方登录录入**：提供「⚡ 官方登录新号」向导，一键调起浏览器官方 OAuth 页面，用户登录完成后自动截获全部账号元数据并原子入库。
-- **双时间窗防作废智能派号引擎 (`M2 - EEQF`)**：
-  - 综合周剩余额度、周刷新剩余时间与账号健康权重计算防作废紧急度评分，一键选出当前最紧急可用账号，自动启动 5h 倒计时并装载上号吐码队列（快捷键 `Ctrl+Shift+D`）。
-- **Chromium 独立目录防关联启动 + 三段式吐码队列 + TOTP 临期防失效 (`M3`)**：
-  - 调用宿主机 Edge / Chrome / Brave 为每个账号创建独立 `--user-data-dir` 与独立 `--proxy-server`（严格拦截命令行参数注入），物理隔离多号 Cookie 与出口 IP。
-  - 三段式顺序吐码（`1.邮箱 -> 2.密码 -> 3.动态2FA`）：当 6 位 TOTP 剩余有效期 `<= 3s` 时自动顺延等待新 30 秒周期验证码，并在粘贴后按设定秒数执行剪贴板阅后即焚（自动校验剪贴板内容防止误删用户文本）。
-- **零网络请求离线 OCR 校准 + 本地 Codex CLI 凭证热切换 (`M4`)**：
-  - 调用 Windows 10/11 内置离线 `Windows.Media.Ocr` 引擎（支持全屏框选截图、系统剪贴板截图 `Win+Shift+S`、本地图片），自动解析中/英文“剩余%”与“已用%（自动换算 `100 - used`）”及周重置倒计时。
-  - 支持捕获本地 `~/.codex/auth.json` 加密快照并一键原子热切换终端 Codex CLI 登录账号。
-- **外购质保防损账本、渠道 ROI 看板与置顶微型胶囊窗 (`M5 & M6`)**：
-  - 支持追踪渠道标签、采购单价、质保倒计时与健康状态（`正常可用` / `疑似降智` / `待接码` / `已封禁`）；支持 Windows 计划任务离线每小时静默巡检周额度与质保临期提醒，一键生成标准化异常账号售后凭条。
-  - 内置 `356 × 106 px` 无边框置顶微型胶囊悬浮窗（Mini HUD），支持拖拽常驻、一键派号、步进吐码与框选 OCR。
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![PyQt5](https://img.shields.io/badge/UI-PyQt5-41CD52?style=flat-square&logo=qt&logoColor=white)](https://pypi.org/project/PyQt5/)
+[![Windows](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6?style=flat-square&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
+[![Tests](https://img.shields.io/badge/Tests-66%2F66%20Passed-16A34A?style=flat-square)](tests/)
+[![Security](https://img.shields.io/badge/Crypto-DPAPI%20%2B%20AES--256--GCM-0F172A?style=flat-square)](src/security.py)
 
-## 本地运行与构建
+</div>
+
+---
+
+## ✨ 界面预览 (UI Showcase)
+
+### 🌙 夜间深邃模式（主调度控制台）
+![Main Dark UI](assets/preview_main_dark.png)
+
+### ☀️ 日间护眼模式（卡片投影 & 双层工具栏）
+![Main Light UI](assets/preview_main_light.png)
+
+### 🌐 节点测速与 VPN / IP 纯净度风控看板
+![Network Lab UI](assets/preview_network_dark.png)
+
+---
+
+## 🚀 核心功能特性
+
+### 1. 系统 Codex 免密自动捕获与实时额度同步 (`src/codex_detector.py`)
+- **全账号自动保留**：后台通过 `QFileSystemWatcher` 实时监测 `~/.codex/auth.json` 变更；每次登录新账号即自动解析 JWT Claims（邮箱、昵称、Plus/Team/Pro 订阅计划与官方到期日），自动建档并将凭据通过 DPAPI 加密归档至 `data/codex_vault/`，切换账号绝不覆盖丢失历史数据。
+- **官方登录向导 (`⚡ 官方登录新号`)**：一键调起官方 OAuth 浏览器登录流，授权完成后毫秒级自动捕获全部信息并入库，**零手动录入**。
+- **5 小时 / 周额度实时同步**：自动读取 `~/.codex/sessions/**/*.jsonl` 中的 `rate_limits` 遥测数据，按 `account_id` / `user_id` 严格跨号隔离，实时同步 5h 剩余百分比、周剩余百分比及精准重置倒计时。
+
+### 2. 节点测速与 VPN 可能性 / IP 纯净度打分 (`src/network_lab.py`)
+- **四协议并发测速**：支持 **TCP 连接**、**系统 Ping (ICMP)**、**HTTP(S) 响应**、**DNS 查询**（代理下自动切换为 TCP DNS 隧道）；支持直连、Windows 系统代理自动检测（支持 `http` / `socks5` / `socks5h`）、手动代理及一键载入账号独立代理。
+- **VPN 可能性 & IP 安全评分 (0–100 分，分数越高风险越低)**：
+  - 穿透当前代理查询真实出口公网 IP、归属国家/地区、城市、ISP 与 ASN。
+  - 结合代理/Tor 出口标记、数据中心 VPS 段、ASN/rDNS 关键词及 AI 平台受限区域综合评分，直观评估节点是否为商业 VPN / 机房 IP 或纯净住宅原生链路。
+
+### 3. 双时间窗防作废智能派号引擎 (`EEQF`)
+- 综合 **周剩余额度**、**周重置剩余时间** 与 **账号健康权重** 计算防作废紧急度评分：
+  $$U_i = \frac{Q_{\text{weekly}}}{\max(h_{\text{left}}, 1.0)} \times W_{\text{health}}$$
+- 按 `Ctrl+Shift+D` 一键派发最紧急可用账号，自动校验周额度余额并开启 5h 倒计时，同步装载三段式上号吐码队列。
+
+### 4. Chromium 独立隔离启动 + 三段式顺序吐码 + TOTP 防过期 (`src/launcher.py`)
+- 为每个账号生成独立 `--user-data-dir` 与独立 `--proxy-server`（拦截参数注入），物理隔离多号 Cookie 与出口 IP。
+- 三段式顺序吐码（`1.邮箱 -> 2.密码 -> 3.动态2FA`）：当 6 位 TOTP 剩余有效期 `<= 3s` 时自动顺延等待新周期码再写入剪贴板，并在粘贴后按设定秒数自动执行剪贴板**阅后即焚**。
+
+### 5. 零网络离线 OCR 校准 + 置顶胶囊窗 + 端到端加密云同步
+- **离线 WinRT OCR (`src/ocr_sync.py`)**：调用 Windows 10/11 原生 `Windows.Media.Ocr`，支持全屏橡皮筋框选、剪贴板截图 (`Win+Shift+S`) 与本地图片识别，自动换算“已用% / 剩余%”与周重置倒计时。
+- **Mini HUD 置顶胶囊窗 (`src/mini_hud.py`)**：`356 × 106 px` 无边框置顶浮窗，支持一键派号、步进吐码与框选 OCR。
+- **DPAPI + AES-256-GCM 端到端加密**：本地凭据通过 Windows DPAPI 绑定系统用户透明加密；跨设备备份与 WebDAV 同步采用 `PBKDF2-HMAC-SHA256 (600,000 轮) + AES-256-GCM`。
+- **资产质保与渠道 ROI 账本**：按卡商渠道统计存活率、翻车率与单次 5h 产出成本，一键生成标准化异常号售后凭条，支持 Windows 计划任务离线静默 Toast 提醒。
+
+---
+
+## 📦 快速开始与源码构建
 
 ```powershell
+# 1. 克隆仓库并安装依赖
+git clone https://github.com/liutq25/gpt-account-manager.git
+cd gpt-account-manager
 pip install -r requirements.txt
 
-# 运行图形界面
+# 2. 启动图形界面
 python main.py
 
-# 运行全量单元测试与对抗测试套件
-python -m unittest discover -s tests -v
+# 3. 运行全量单元测试与对抗测试套件 (66 项)
+python -m pytest tests/ -v
 
-# 编译单文件独立 EXE
+# 4. 打包为单文件绿色 EXE
 python -m PyInstaller --clean --noconfirm "GPT管理助手.spec"
+```
+
+---
+
+## 📁 项目结构
+
+```text
+├── main.py                      # 应用入口（支持 GUI 与 --check-notify 离线静默巡检模式）
+├── GPT管理助手.spec              # PyInstaller 单文件打包配置
+├── src/
+│   ├── models.py                # 账号模型、EEQF 调度算法、TOTP 安全窗口、ROI 统计
+│   ├── security.py              # Windows DPAPI 加解密、PBKDF2+AES-256-GCM 跨端加密、WebDAV 同步
+│   ├── storage.py               # 原子落盘存储、结构化 JSONL 审计日志、Windows 计划任务集成
+│   ├── codex_detector.py        # Codex auth.json 实时监测、JWT 解析、OAuth 登录与遥测额度同步
+│   ├── network_lab.py           # 多协议测速引擎、HTTP/SOCKS5 代理隧道、VPN/IP 风险评分引擎
+│   ├── network_widget.py        # 「节点测速与 IP 风控」PyQt5 交互界面
+│   ├── launcher.py              # Chromium 隔离启动器与三段式顺序吐码状态机
+│   ├── ocr_sync.py              # Windows 原生 WinRT OCR 引擎与 ~/.codex/auth.json 热切换器
+│   ├── mini_hud.py              # 置顶微型悬浮胶囊窗与全屏框选截图器
+│   ├── dialogs.py               # 账号录入/批量导入/Codex登录/OCR回填/系统设置弹窗群
+│   ├── ui_styles.py             # 现代日间/夜间双主题设计系统与 QSS 样式引擎
+│   └── main_window.py           # 主调度控制台与系统托盘集成
+├── tests/                       # 全量单元测试、混沌对抗测试与集成测试 (66 passed)
+└── assets/                      # 应用图标与界面预览截图
 ```
