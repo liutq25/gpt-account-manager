@@ -2263,8 +2263,14 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def closeEvent(self, event) -> None:
-        if getattr(self, "_is_force_quitting", False):
+        if getattr(self, "_is_force_quitting", False) or not self.isVisible():
             self.paste_ctrl.cancel(burn_now=True)
+            if hasattr(self, "_tick_timer"):
+                self._tick_timer.stop()
+            if hasattr(self, "_startup_codex_timer"):
+                self._startup_codex_timer.stop()
+            if hasattr(self, "codex_monitor"):
+                self.codex_monitor._poll_timer.stop()
             if hasattr(self, "network_tab"):
                 self.network_tab.shutdown()
             self.mini_hud.close()

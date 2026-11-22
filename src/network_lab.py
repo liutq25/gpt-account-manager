@@ -24,7 +24,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GPTManagerSpeedLab/3.1"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+_FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
 
 PROTOCOLS: List[Tuple[str, str]] = [
     ("tcp", "TCP 连接"),
@@ -108,15 +112,33 @@ def is_public_ip(ip: str) -> bool:
         return False
 
 
+def is_fake_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip.strip()) in _FAKE_IP_NET
+    except ValueError:
+        return False
+
+
 def get_local_ip() -> str:
+    candidate = "127.0.0.1"
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
+        candidate = sock.getsockname()[0]
     except OSError:
-        return "127.0.0.1"
+        candidate = "127.0.0.1"
     finally:
         sock.close()
+
+    if is_fake_ip(candidate) or candidate.startswith("127."):
+        try:
+            _, _, ips = socket.gethostbyname_ex(socket.gethostname())
+            for ip in ips:
+                if not is_fake_ip(ip) and not ip.startswith("127.") and not ip.startswith("169.254."):
+                    return ip
+        except OSError:
+            pass
+    return candidate
 
 
 def parse_target(raw: str) -> Dict[str, Any]:
@@ -341,6 +363,18 @@ def evaluate_ip_risk(info: Dict[str, Any]) -> IpRiskReport:
     source = str(info.get("source") or "").strip()
 
     if ip and not is_public_ip(ip):
+        if is_fake_ip(ip):
+            return IpRiskReport(
+                ip=ip,
+                country="代理 Fake-IP (虚拟映射)",
+                country_code="",
+                isp="TUN / Fake-IP",
+                vpn_probability=0,
+                risk_score=100,
+                risk_level="虚拟映射地址",
+                deductions=[],
+                source=source,
+            )
         return IpRiskReport(
             ip=ip,
             country="内网地址",
@@ -707,11 +741,27 @@ class NetworkSpeedEngine:
         start = time.perf_counter()
         if proxy is None:
             sock = socket.create_connection((host, port), timeout=timeout)
-        else:
-            sock = proxy.connect(host, port, timeout)
-        ms = (time.perf_counter() - start) * 1000.0
-        sock.close()
-        return ms
+            ms = (time.perf_counter() - start) * 1000.0
+            sock.close()
+            return ms
+
+        # Over proxies (e.g. Clash/Mihomo), CONNECT often returns 200/0x00 optimistically
+        # before reaching the remote host. Perform TLS handshake on port 443 for true RTT.
+        sock = proxy.connect(host, port, timeout)
+        try:
+            if port == 443:
+                ctx = ssl._create_unverified_context()
+                tls_sock = ctx.wrap_socket(sock, server_hostname=host)
+                ms = (time.perf_counter() - start) * 1000.0
+                tls_sock.close()
+                return ms
+            ms = (time.perf_counter() - start) * 1000.0
+            return ms
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
     @staticmethod
     def icmp_ping(host: str, count: int = 4, timeout_ms: int = 2000) -> List[Optional[float]]:
@@ -764,9 +814,13 @@ class NetworkSpeedEngine:
                 conn = http.client.HTTPConnection(host, port, timeout=timeout)
                 if tunnel is not None:
                     conn.sock = tunnel
-            conn.request("HEAD", path or "/", headers={"User-Agent": USER_AGENT})
+            headers = {
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/json,*/*;q=0.8",
+                "Connection": "close",
+            }
+            conn.request("HEAD", path or "/", headers=headers)
             resp = conn.getresponse()
-            resp.read()
             code = resp.status
             if code in (405, 501):
                 conn.close()
@@ -804,9 +858,14 @@ class NetworkSpeedEngine:
                 conn = http.client.HTTPConnection(host, port, timeout=timeout)
                 if tunnel is not None:
                     conn.sock = tunnel
-            conn.request("GET", path or "/", headers={"User-Agent": USER_AGENT})
+            headers = {
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/json,*/*;q=0.8",
+                "Connection": "close",
+            }
+            conn.request("GET", path or "/", headers=headers)
             resp = conn.getresponse()
-            resp.read()
+            resp.read(1024)
             return (time.perf_counter() - start) * 1000.0, resp.status
         finally:
             if conn is not None:
@@ -855,7 +914,7 @@ class NetworkConfig:
     manual_proxy: str = DEFAULT_MANUAL_PROXY
     dns_server: str = DEFAULT_DNS_SERVER
     samples: int = 4
-    timeout: float = 3.0
+    timeout: float = 6.0
     interval: int = 30
     auto_loop: bool = False
 
@@ -888,7 +947,7 @@ class NetworkConfig:
                 manual_proxy=str(data.get("manual_proxy", DEFAULT_MANUAL_PROXY)),
                 dns_server=str(data.get("dns_server", DEFAULT_DNS_SERVER)),
                 samples=max(1, min(20, int(data.get("samples", 4)))),
-                timeout=max(0.5, min(30.0, float(data.get("timeout", 3.0)))),
+                timeout=max(1.0, min(30.0, float(data.get("timeout", 6.0)))),
                 interval=max(5, min(600, int(data.get("interval", 30)))),
                 auto_loop=bool(data.get("auto_loop", False)),
             )

@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -99,11 +100,16 @@ class NetworkLabTab(QWidget):
         self._ip_refresh_timer.timeout.connect(self.refresh_exit_ip)
         self._ip_refresh_timer.start()
 
-        # Defer initial exit IP lookup slightly so window opens instantaneously
         self._init_probe_timer = QTimer(self)
         self._init_probe_timer.setSingleShot(True)
         self._init_probe_timer.timeout.connect(self._on_initial_probe)
-        self._init_probe_timer.start(350)
+        self._did_initial_probe = False
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if not self._did_initial_probe:
+            self._did_initial_probe = True
+            self._init_probe_timer.start(150)
 
     def _on_initial_probe(self) -> None:
         self._redetect_system_proxy(silent=True)
@@ -254,6 +260,16 @@ class NetworkLabTab(QWidget):
         ab_lay.addWidget(self.btn_del_target)
         ab_lay.addStretch()
 
+        ab_lay.addWidget(QLabel("超时(秒):"))
+        self.timeout_spin = QDoubleSpinBox()
+        self.timeout_spin.setRange(1.0, 30.0)
+        self.timeout_spin.setDecimals(1)
+        self.timeout_spin.setSingleStep(1.0)
+        self.timeout_spin.setValue(max(4.0, self.cfg.timeout) if self.cfg.timeout == 3.0 else self.cfg.timeout)
+        self.timeout_spin.setToolTip("单次请求/握手超时时间（代理环境下建议 6 秒以上）")
+        self.timeout_spin.valueChanged.connect(self._save_cfg_from_ui)
+        ab_lay.addWidget(self.timeout_spin)
+
         self.auto_loop_chk = QCheckBox("自动循环测试")
         self.auto_loop_chk.setChecked(self.cfg.auto_loop)
         self.auto_loop_chk.toggled.connect(self._on_auto_loop_toggled)
@@ -342,6 +358,7 @@ class NetworkLabTab(QWidget):
         elif mode == "从账号导入代理":
             self.cfg.proxy_mode = "手动代理"
         self.cfg.manual_proxy = self.manual_proxy_edit.text().strip() or self.cfg.manual_proxy
+        self.cfg.timeout = float(self.timeout_spin.value())
         self.cfg.interval = int(self.interval_spin.value())
         self.cfg.auto_loop = bool(self.auto_loop_chk.isChecked())
         self.cfg.targets = [entry["raw"] for entry in self._hosts.values()]
@@ -625,7 +642,7 @@ class NetworkLabTab(QWidget):
 
         proto = str(self.proto_combo.currentData() or "tcp")
         samples = self.cfg.samples
-        timeout = self.cfg.timeout
+        timeout = float(self.timeout_spin.value())
         dns_server = self.cfg.dns_server
 
         self._stop_event.clear()
