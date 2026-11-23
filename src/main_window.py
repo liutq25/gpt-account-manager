@@ -533,6 +533,7 @@ class MainWindow(QMainWindow):
         self.account_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.account_table.verticalHeader().setVisible(False)
         self.account_table.setFocusPolicy(Qt.NoFocus)
+        self.account_table.cellDoubleClicked.connect(self._on_table_cell_double_clicked)
 
         header = self.account_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Interactive)
@@ -553,7 +554,7 @@ class MainWindow(QMainWindow):
         self.account_table.setColumnWidth(5, 102)
         self.account_table.setColumnWidth(6, 115)
         self.account_table.setColumnWidth(7, 122)
-        self.account_table.setColumnWidth(8, 224)
+        self.account_table.setColumnWidth(8, 310)
 
         layout.addWidget(self.account_table, 1)
         return tab
@@ -766,6 +767,12 @@ class MainWindow(QMainWindow):
         self._row_widgets.clear()
         self.account_table.setRowCount(len(visible))
         now = time.time()
+        curr_codex_prof = (
+            self.codex_monitor._last_profile if hasattr(self, "codex_monitor") else None
+        )
+        active_codex_email = (
+            (curr_codex_prof.email or "").strip().lower() if curr_codex_prof else ""
+        )
         if hasattr(self, "mini_hud") and self.mini_hud.isVisible():
             prov_filter = (
                 self.provider_filter_combo.currentText()
@@ -915,11 +922,42 @@ class MainWindow(QMainWindow):
             w_timer_lbl.setAlignment(Qt.AlignCenter)
             self.account_table.setCellWidget(row_idx, 7, w_timer_lbl)
 
-            # Col 8: Actions (Launch/Paste Menu + Quota + Edit + Delete)
+            # Col 8: Actions (Codex Quick Switch + Launch/Paste Menu + Quota + Edit + Delete)
             act_cell = QWidget()
             act_lay = QHBoxLayout(act_cell)
             act_lay.setContentsMargins(4, 4, 4, 4)
             act_lay.setSpacing(4)
+
+            is_active_codex = bool(
+                active_codex_email and acc.email.strip().lower() == active_codex_email
+            )
+            has_snap = self.codex_mgr.has_snapshot(acc.id)
+
+            switch_btn = QPushButton()
+            if is_active_codex:
+                switch_btn.setText("🟢 使用中")
+                switch_btn.setEnabled(False)
+                switch_btn.setStyleSheet(
+                    "padding: 3px 6px; font-size: 11px; background-color: #064E3B; "
+                    "border: 1px solid #059669; color: #6EE7B7; font-weight: 700; border-radius: 4px;"
+                )
+                switch_btn.setToolTip("当前本地 ~/.codex 正在使用此账号授权，终端与插件可直接调用")
+            elif has_snap:
+                switch_btn.setText("⚡ 切为此号")
+                switch_btn.setStyleSheet(
+                    "padding: 3px 6px; font-size: 11px; background-color: #047857; "
+                    "border: 1px solid #10B981; color: #FFFFFF; font-weight: 700; border-radius: 4px;"
+                )
+                switch_btn.setToolTip("一键将本地 ~/.codex/auth.json 切换为此账号授权（0.05秒原子生效）")
+                switch_btn.clicked.connect(lambda _=False, aid=acc.id: self._on_quick_switch_codex(aid))
+            else:
+                switch_btn.setText("🔗 绑定授权")
+                switch_btn.setStyleSheet(
+                    f"padding: 3px 6px; font-size: 11px; background-color: {p.surface_bg}; "
+                    f"border: 1px dashed {p.border}; color: {p.text_secondary}; border-radius: 4px;"
+                )
+                switch_btn.setToolTip("该账号尚未保存本地 Codex 授权快照。点击绑定当前已登录授权或调起登录")
+                switch_btn.clicked.connect(lambda _=False, aid=acc.id: self._on_quick_bind_codex(aid))
 
             launch_btn = QPushButton("上号▾")
             launch_btn.setStyleSheet(
@@ -936,7 +974,6 @@ class MainWindow(QMainWindow):
                 lambda aid=acc.id: self._on_start_paste_only(aid),
             )
             l_menu.addSeparator()
-            has_snap = self.codex_mgr.has_snapshot(acc.id)
             snap_mark = " (已绑定)" if has_snap else ""
             l_menu.addAction(
                 f"⚡ 切换本地 ~/.codex 授权为此号{snap_mark}",
@@ -971,6 +1008,7 @@ class MainWindow(QMainWindow):
             )
             del_btn.clicked.connect(lambda _=False, aid=acc.id: self._on_delete_account(aid))
 
+            act_lay.addWidget(switch_btn)
             act_lay.addWidget(launch_btn)
             act_lay.addWidget(quota_btn)
             act_lay.addWidget(edit_btn)
@@ -1293,10 +1331,10 @@ class MainWindow(QMainWindow):
         except Exception as err:
             QMessageBox.warning(self, "捕获 Codex 授权失败", str(err))
 
-    def _on_activate_codex_auth(self, account_id: str) -> None:
+    def _on_activate_codex_auth(self, account_id: str, quiet: bool = False) -> bool:
         acc = self._find_account(account_id)
         if acc is None:
-            return
+            return False
         try:
             target_auth = self.codex_mgr.activate_snapshot(acc.id)
             self._focused_account_id = acc.id
@@ -1304,13 +1342,94 @@ class MainWindow(QMainWindow):
                 "INFO",
                 "CODEX_AUTH_SWITCHED",
                 f"已原子切换 {target_auth} 为当前账号授权（原文件已备份为 auth.json.bak）。",
-                f"{acc.name}",
+                f"{acc.name} ({acc.email})",
             )
-            QMessageBox.information(
-                self, "切换成功", f"已将本地 Codex CLI 授权切换为账号「{acc.name}」。"
-            )
+            if hasattr(self, "codex_monitor"):
+                self.codex_monitor.check_now()
+            self._rebuild_account_table()
+            msg = f"⚡ 已成功切换本地 Codex 授权为「{acc.name}」({acc.email})，终端与插件已即时生效！"
+            self.status_bar.showMessage(msg, 6000)
+            if quiet:
+                send_windows_toast("Codex 授权切换成功", msg)
+            else:
+                QMessageBox.information(
+                    self, "切换成功", f"已将本地 Codex CLI 授权切换为账号「{acc.name}」。"
+                )
+            return True
         except Exception as err:
+            self._record_log("ERROR", "CODEX_AUTH_SWITCH_FAILED", str(err), f"{acc.name}")
             QMessageBox.warning(self, "切换 Codex 授权失败", str(err))
+            return False
+
+    def _on_quick_switch_codex(self, account_id: str) -> None:
+        self._on_activate_codex_auth(account_id, quiet=True)
+
+    def _on_quick_bind_codex(self, account_id: str) -> None:
+        acc = self._find_account(account_id)
+        if acc is None:
+            return
+        curr_prof = self.codex_monitor.current_profile if hasattr(self, "codex_monitor") else None
+        if curr_prof is not None and curr_prof.email:
+            curr_email = curr_prof.email.strip().lower()
+            target_email = acc.email.strip().lower()
+            if curr_email == target_email:
+                try:
+                    dest = self.codex_mgr.capture_current_auth(acc.id)
+                    self._record_log(
+                        "INFO",
+                        "CODEX_AUTH_CAPTURED",
+                        f"已自动捕获当前 ~/.codex/auth.json 并加密绑定至「{acc.name}」({dest.name})。",
+                        acc.name,
+                    )
+                    self._rebuild_account_table()
+                    self.status_bar.showMessage(
+                        f"🔗 已成功将宿主机当前 Codex 授权自动绑定至「{acc.name}」！", 5000
+                    )
+                except Exception as err:
+                    QMessageBox.warning(self, "绑定授权失败", str(err))
+                return
+
+            reply = QMessageBox.question(
+                self,
+                "绑定 Codex 授权",
+                f"当前宿主机已登录的 Codex 账号为「{curr_prof.email}」，与本账号「{acc.email}」不同。\n\n"
+                f"• 点击「是 (Yes)」：调起官方浏览器为「{acc.name}」登录新授权并自动绑定；\n"
+                f"• 点击「否 (No)」：强行将当前的「{curr_prof.email}」授权绑定至本号；\n"
+                f"• 点击「取消」：放弃操作。",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                self._on_codex_login_ingest()
+            elif reply == QMessageBox.No:
+                try:
+                    self.codex_mgr.capture_current_auth(acc.id)
+                    self._rebuild_account_table()
+                    self.status_bar.showMessage(
+                        f"🔗 已将当前授权快照绑定至账号「{acc.name}」。", 5000
+                    )
+                except Exception as err:
+                    QMessageBox.warning(self, "绑定授权失败", str(err))
+        else:
+            reply = QMessageBox.question(
+                self,
+                "未检测到本地登录",
+                "本地 ~/.codex/auth.json 尚未登录任何账号。\n\n是否立即调起官方浏览器进行登录？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                self._on_codex_login_ingest()
+
+    def _on_table_cell_double_clicked(self, row: int, col: int) -> None:
+        visible = self._filtered_accounts()
+        if 0 <= row < len(visible):
+            acc = visible[row]
+            if self.codex_mgr.has_snapshot(acc.id):
+                curr_prof = self.codex_monitor.current_profile if hasattr(self, "codex_monitor") else None
+                active_email = (curr_prof.email or "").strip().lower() if curr_prof else ""
+                if active_email != acc.email.strip().lower():
+                    self._on_quick_switch_codex(acc.id)
 
     def _on_probe_account_network(self, account_id: str) -> None:
         acc = self._find_account(account_id)
@@ -1336,6 +1455,7 @@ class MainWindow(QMainWindow):
             if hasattr(self, "codex_banner"):
                 self.codex_banner.setVisible(False)
             self._pending_codex_profile = None
+            self._rebuild_account_table()
             return
 
         plan_desc = profile.display_plan
@@ -1367,7 +1487,7 @@ class MainWindow(QMainWindow):
                 matched.warranty_expire_at = profile.subscription_expire_timestamp
                 matched.updated_at = time.time()
                 self._save_accounts_safe()
-                self._rebuild_account_table()
+            self._rebuild_account_table()
         else:
             self._pending_codex_profile = profile
             if email.lower() not in self._deleted_codex_emails_this_session:

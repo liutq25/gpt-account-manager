@@ -294,3 +294,89 @@ def test_main_window_auto_surveillance_and_ingestion(qapp, tmp_path: Path):
     assert len([a for a in win.accounts if a.email == "account_two@codex.com"]) == 1
 
     win.close()
+
+
+def test_one_click_codex_switch_button_and_actions(qapp, tmp_path):
+    storage_dir = tmp_path / "app_data"
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    auth_file = codex_home / "auth.json"
+
+    # Seed auth.json with account 1
+    jwt1 = _make_dummy_jwt({
+        "email": "alpha@codex.com",
+        "name": "Alpha User",
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "plus", "chatgpt_account_id": "a-1"},
+    })
+    auth_file.write_text(json.dumps({"tokens": {"id_token": jwt1}}), encoding="utf-8")
+
+    storage = AccountStorage(base_dir=storage_dir)
+    win = MainWindow(storage=storage, codex_home=codex_home)
+
+    with patch("src.main_window.send_windows_toast"):
+        win.codex_monitor.check_now()
+
+    # Ingest account 2
+    jwt2 = _make_dummy_jwt({
+        "email": "beta@codex.com",
+        "name": "Beta User",
+        "https://api.openai.com/auth": {"chatgpt_plan_type": "pro", "chatgpt_account_id": "b-2"},
+    })
+    time.sleep(0.02)
+    auth_file.write_text(json.dumps({"tokens": {"id_token": jwt2}}), encoding="utf-8")
+
+    with patch("src.main_window.send_windows_toast"):
+        win.codex_monitor.check_now()
+
+    assert len(win.accounts) == 2
+    acc_alpha = next(a for a in win.accounts if a.email == "alpha@codex.com")
+    acc_beta = next(a for a in win.accounts if a.email == "beta@codex.com")
+
+    # Currently Beta is active in auth.json
+    win._rebuild_account_table()
+    rows = win._filtered_accounts()
+    row_alpha = rows.index(acc_alpha)
+    row_beta = rows.index(acc_beta)
+
+    btn_alpha = win.account_table.cellWidget(row_alpha, 8).layout().itemAt(0).widget()
+    btn_beta = win.account_table.cellWidget(row_beta, 8).layout().itemAt(0).widget()
+
+    assert btn_beta.text() == "🟢 使用中"
+    assert not btn_beta.isEnabled()
+    assert btn_alpha.text() == "⚡ 切为此号"
+    assert btn_alpha.isEnabled()
+
+    # Action: Click ⚡ 切为此号 on Alpha
+    with patch("PyQt5.QtWidgets.QMessageBox.information"), patch("src.main_window.send_windows_toast"):
+        win._on_quick_switch_codex(acc_alpha.id)
+
+    # After switch: Alpha must now be active
+    content = json.loads(auth_file.read_text(encoding="utf-8"))
+    assert content["tokens"]["id_token"] == jwt1
+    assert "alpha@codex.com" in win.codex_status_badge.text()
+
+    btn_alpha_after = win.account_table.cellWidget(row_alpha, 8).layout().itemAt(0).widget()
+    btn_beta_after = win.account_table.cellWidget(row_beta, 8).layout().itemAt(0).widget()
+
+    assert btn_alpha_after.text() == "🟢 使用中"
+    assert not btn_alpha_after.isEnabled()
+    assert btn_beta_after.text() == "⚡ 切为此号"
+    assert btn_beta_after.isEnabled()
+
+    # Test double click row to switch back to Beta
+    with patch("PyQt5.QtWidgets.QMessageBox.information"), patch("src.main_window.send_windows_toast"):
+        win._on_table_cell_double_clicked(row_beta, 0)
+
+    content2 = json.loads(auth_file.read_text(encoding="utf-8"))
+    assert content2["tokens"]["id_token"] == jwt2
+    assert "beta@codex.com" in win.codex_status_badge.text()
+
+    # Add account without snapshot -> should display 🔗 绑定授权
+    acc_gamma = Account(id="g-3", name="Gamma", email="gamma@codex.com", password="pwd", two_fa="JBSWY3DPEHPK3PXP", provider="Codex")
+    win.accounts.append(acc_gamma)
+    win._rebuild_account_table()
+    row_gamma = win._filtered_accounts().index(acc_gamma)
+    btn_gamma = win.account_table.cellWidget(row_gamma, 8).layout().itemAt(0).widget()
+    assert btn_gamma.text() == "🔗 绑定授权"
+
+    win.close()
